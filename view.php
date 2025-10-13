@@ -1,7 +1,7 @@
 <?php
 session_start();
 if (!isset($_SESSION['username']) || $_SESSION['role'] !== 'admin') {
-    header("Location: Login1.php");
+    header("Location: login.php");
     exit;
 }
 
@@ -119,35 +119,34 @@ w.document.write(`
   body {
     margin: 0;
     padding: 0;
-    display: flex;
-    flex-direction: column;
   }
   .page {
-    display: grid;
-    grid-template-columns: repeat(3, 1fr);
-    grid-template-rows: repeat(3, 1fr);
     width: 8cm;
     height: 3.4cm;
     margin-top: -4px;
     page-break-after: always;
   }
+  .page table {
+    width: 100%;
+    height: 100%;
+    table-layout: fixed;
+    border-collapse: collapse;
+  }
   .label {
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    justify-content: center;
+    text-align: center;
+    vertical-align: middle;
     font-size: 10pt;
   }
   .label svg {
     width: 88px;
     height: 0.8cm;
-    
   }
   .label small {
     font-family: Arial, sans-serif;
     font-size: 6.1pt;
     font-weight: bold;
     margin-top: -4px;
+    display: block;
   }
   .custom {
     font-family: Arial, sans-serif;
@@ -161,19 +160,27 @@ w.document.write('</style></head><body onload="window.print();">');
 <?php 
 $chunks = array_chunk($numbers, 9); 
 foreach ($chunks as $pageIndex => $chunk): ?>
-  w.document.write('<div class="page">');
-  <?php foreach ($chunk as $i => $num): 
-    $id = "code{$pageIndex}_{$i}"; ?>
-    w.document.write('<div class="label">');
-    w.document.write('<svg id="<?= $id ?>"></svg>');
-    w.document.write('<small><?= $num ?></small>');
-    w.document.write('<div class="custom"><?= htmlspecialchars($customText) ?></div>');
-    w.document.write('</div>');
-  <?php endforeach; ?>
-  w.document.write('</div>');
+  w.document.write('<div class="page"><table><tr>');
+  <?php for ($row = 0; $row < 3; $row++): ?>
+    w.document.write('<tr>');
+    <?php for ($col = 0; $col < 3; $col++): ?>
+      <?php $idx = $row * 3 + $col; ?>
+      <?php if (isset($chunk[$idx])): $num = $chunk[$idx]; $id = "code{$pageIndex}_{$idx}"; ?>
+        w.document.write('<td class="label">');
+        w.document.write('<svg id="<?= $id ?>"></svg>');
+        w.document.write('<small><?= $num ?></small>');
+        w.document.write('<div class="custom"><?= htmlspecialchars($customText) ?></div>');
+        w.document.write('</td>');
+      <?php else: ?>
+        w.document.write('<td></td>');
+      <?php endif; ?>
+    <?php endfor; ?>
+    w.document.write('</tr>');
+  <?php endfor; ?>
+  w.document.write('</table></div>');
 <?php endforeach; ?>
 
-w.document.write('<script src="JS2/JsBarcode.all.min.js"><\/script>');
+w.document.write('<script src="https://cdn.jsdelivr.net/npm/jsbarcode@3.11.6/dist/JsBarcode.all.min.js"><\/script>');
 w.document.write('<script>');
 <?php 
 foreach ($chunks as $pageIndex => $chunk) {
@@ -239,8 +246,12 @@ if ($selectedBatchId) {
 <html lang="id">
 <head>
   <meta charset="UTF-8">
+  <!--[if lt IE 9]>
+  <script src="https://oss.maxcdn.com/html5shiv/3.7.3/html5shiv.min.js"></script>
+  <script src="https://oss.maxcdn.com/respond/1.4.2/respond.min.js"></script>
+  <![endif]-->
   <title>PCB Barcode Print</title>
-  <script src="JS2/JsBarcode.all.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/jsbarcode@3.11.6/dist/JsBarcode.all.min.js"></script>
   <style>
     body {
       font-family: Arial, sans-serif;
@@ -692,7 +703,7 @@ if ($selectedBatchId) {
   <?php endif; ?>
 
   <div style="text-align: right;">
-    <a href="Logout1.php">Logout</a>
+    <a href="logout.php">Logout</a>
   </div>
 
   <?php if (!empty($printScript)) echo $printScript; ?>
