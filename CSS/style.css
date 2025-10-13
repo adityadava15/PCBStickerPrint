@@ -1,0 +1,91 @@
+body {
+  margin: 0;
+  padding: 0;
+  font-family: Arial, sans-serif;
+}
+
+@page {
+  size: 8cm 3.4cm; /* ukuran label */
+  margin: 0;
+}
+
+.label {
+  width: 2.5cm;
+  height: 1.1cm;
+  margin-left: 0.05cm;
+  padding: 0;
+  display: inline-block;
+  text-align: center;
+  vertical-align: top;
+  page-break-inside: avoid;
+}
+
+.label svg {
+  width: 2.2cm;      /* lebih ramping */
+  height: 0.4cm;     /* lebih pendek */
+  margin-top: 5px;
+}
+
+.code {
+  font-size: 9px;    /* lebih kecil */
+  font-weight: bold;
+  line-height: 1;
+  margin-top: -2px;
+}
+
+.text {
+  font-size: 6px;    /* lebih kecil */
+  line-height: 1;
+  margin: 0;
+}
+
+.text-input{
+  width: 209px;
+  padding: 5px;
+}
+
+.From-to {
+  width: 45px;
+}
+
+.labels-container {
+  display: flex;
+  flex-wrap: wrap;
+  align-content: flex-start;
+  padding-left: 0.15cm;
+}
+
+.no-print {
+  display: block;
+}
+
+@media print {
+  .no-print {
+    display: none;
+  }
+}
+
+/* Optional: Modal popup */
+#popup {
+  position: fixed;
+  top: 0; left: 0; right: 0; bottom: 0;
+  background: rgba(0,0,0,0.5);
+  display: none;
+  justify-content: center;
+  align-items: center;
+  z-index: 1000;
+}
+
+#popup .modal {
+  background: #e7ffe7;
+  border: 2px solid green;
+  padding: 20px;
+  border-radius: 8px;
+  text-align: center;
+  width: 300px;
+}
+
+#popup button {
+  margin: 10px;
+  padding: 6px 12px;
+}
