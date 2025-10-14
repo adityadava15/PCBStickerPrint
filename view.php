@@ -1,7 +1,7 @@
 <?php
 session_start();
 if (!isset($_SESSION['username']) || $_SESSION['role'] !== 'admin') {
-    header("Location: login.php");
+    header("Location: Login1.php");
     exit;
 }
 
@@ -123,7 +123,7 @@ w.document.write(`
   .page {
     width: 8cm;
     height: 3.4cm;
-    margin-top: -4px;
+    margin-top: -10px;
     page-break-after: always;
   }
   .page table {
@@ -131,28 +131,30 @@ w.document.write(`
     height: 100%;
     table-layout: fixed;
     border-collapse: collapse;
+    margin-top: -5px;
   }
   .label {
     text-align: center;
     vertical-align: middle;
-    font-size: 10pt;
+    font-size: 8pt;
   }
   .label svg {
     width: 88px;
-    height: 0.8cm;
+    height: 0.79cm;
+    margin-bottom: 0px;
   }
   .label small {
     font-family: Arial, sans-serif;
     font-size: 6.1pt;
     font-weight: bold;
-    margin-top: -4px;
+    margin-top: -4.6px;
     display: block;
   }
   .custom {
     font-family: Arial, sans-serif;
-    font-size: 5pt;
+    font-size: 4.4pt;
     font-weight: bold;
-    margin-top: 1px;
+    margin-top: -1px;
   }
 `);
 w.document.write('</style></head><body onload="window.print();">');
@@ -180,7 +182,7 @@ foreach ($chunks as $pageIndex => $chunk): ?>
   w.document.write('</table></div>');
 <?php endforeach; ?>
 
-w.document.write('<script src="https://cdn.jsdelivr.net/npm/jsbarcode@3.11.6/dist/JsBarcode.all.min.js"><\/script>');
+w.document.write('<script src="JS2/JsBarcode.all.min.js"><\/script>');
 w.document.write('<script>');
 <?php 
 foreach ($chunks as $pageIndex => $chunk) {
@@ -251,7 +253,7 @@ if ($selectedBatchId) {
   <script src="https://oss.maxcdn.com/respond/1.4.2/respond.min.js"></script>
   <![endif]-->
   <title>PCB Barcode Print</title>
-  <script src="https://cdn.jsdelivr.net/npm/jsbarcode@3.11.6/dist/JsBarcode.all.min.js"></script>
+  <script src="JS2/JsBarcode.all.min.js"></script>
   <style>
     body {
       font-family: Arial, sans-serif;
@@ -703,7 +705,7 @@ if ($selectedBatchId) {
   <?php endif; ?>
 
   <div style="text-align: right;">
-    <a href="logout.php">Logout</a>
+    <a href="Logout1.php">Logout</a>
   </div>
 
   <?php if (!empty($printScript)) echo $printScript; ?>
