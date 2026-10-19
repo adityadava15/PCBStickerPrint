@@ -1,0 +1,46 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 220" role="img" aria-labelledby="logoTitle">
+  <title id="logoTitle">Barcode Print Generator</title>
+  <defs>
+    <filter id="shadow" x="-10%" y="-10%" width="120%" height="130%">
+      <feDropShadow dx="0" dy="8" stdDeviation="7" flood-color="#000000" flood-opacity="0.42"/>
+    </filter>
+  </defs>
+  <g filter="url(#shadow)">
+    <text
+      x="380"
+      y="90"
+      text-anchor="middle"
+      fill="#ffffff"
+      stroke="#0a0a0a"
+      stroke-width="4"
+      paint-order="stroke fill"
+      font-family="Arial Black, Impact, sans-serif"
+      font-size="96"
+      font-weight="900"
+      letter-spacing="-2"
+    >Barcode Print</text>
+    <line
+      x1="118"
+      y1="126"
+      x2="642"
+      y2="126"
+      stroke="#ffffff"
+      stroke-width="5"
+      stroke-linecap="round"
+      opacity="0.9"
+    />
+    <text
+      x="380"
+      y="194"
+      text-anchor="middle"
+      fill="#ffffff"
+      stroke="#0a0a0a"
+      stroke-width="2.5"
+      paint-order="stroke fill"
+      font-family="Arial Black, Impact, sans-serif"
+      font-size="54"
+      font-weight="900"
+      letter-spacing="10"
+    >GENERATOR</text>
+  </g>
+</svg>

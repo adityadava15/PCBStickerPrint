@@ -1,0 +1,9 @@
+# Local checkpoints and temporary files
+_checkpoint_before_range_input/
+db_check.php
+
+# IDE and OS files
+.vscode/
+.idea/
+*.tmp
+Thumbs.db

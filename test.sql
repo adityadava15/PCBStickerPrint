@@ -62,7 +62,8 @@ CREATE TABLE `log_print` (
   `nama_batch` varchar(20) DEFAULT NULL,
   `start_number` bigint(20) DEFAULT NULL,
   `end_number` bigint(20) DEFAULT NULL,
-  `printed_at` timestamp NOT NULL DEFAULT current_timestamp()
+  `printed_at` timestamp NOT NULL DEFAULT current_timestamp(),
+  `username` varchar(100) DEFAULT NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=latin1 COLLATE=latin1_swedish_ci;
 
 --

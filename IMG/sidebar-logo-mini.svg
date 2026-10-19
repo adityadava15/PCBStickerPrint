@@ -1,0 +1,46 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-labelledby="miniLogoTitle">
+  <title id="miniLogoTitle">BP</title>
+  <defs>
+    <filter id="miniShadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="4" stdDeviation="3" flood-color="#000000" flood-opacity="0.35"/>
+    </filter>
+  </defs>
+  <g filter="url(#miniShadow)">
+    <text
+      x="32"
+      y="30"
+      text-anchor="middle"
+      fill="#ffffff"
+      stroke="#0a0a0a"
+      stroke-width="1.8"
+      paint-order="stroke fill"
+      font-family="Arial Black, Impact, sans-serif"
+      font-size="28"
+      font-weight="900"
+      letter-spacing="-1"
+    >BP</text>
+    <line
+      x1="12"
+      y1="38"
+      x2="52"
+      y2="38"
+      stroke="#ffffff"
+      stroke-width="2.5"
+      stroke-linecap="round"
+      opacity="0.95"
+    />
+    <text
+      x="32"
+      y="54"
+      text-anchor="middle"
+      fill="#ffffff"
+      stroke="#0a0a0a"
+      stroke-width="1"
+      paint-order="stroke fill"
+      font-family="Arial Black, Impact, sans-serif"
+      font-size="11"
+      font-weight="900"
+      letter-spacing="2"
+    >GEN</text>
+  </g>
+</svg>

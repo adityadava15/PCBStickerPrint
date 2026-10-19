@@ -1,3 +1,0 @@
-const modal = document.getElementById("resultModal")
-              if (modal) modal.style.display = "none";
-               window.location.href = "view.php";

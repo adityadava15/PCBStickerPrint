@@ -10,7 +10,7 @@ if (isset($_SESSION['username'])) {
     exit;
 }
 
-$koneksi = new mysqli("localhost", "root", "", "test");
+$koneksi = new mysqli("192.168.88.254:3307", "root", "", "test");
 if ($koneksi->connect_errno) {
     die("Koneksi gagal: " . $koneksi->connect_error);
 }
@@ -18,15 +18,18 @@ if ($koneksi->connect_errno) {
 $error = '';
 $success = '';
 if (isset($_POST['register'])) {
-    $username = $koneksi->real_escape_string($_POST['username']);
-    $password = password_hash($_POST['password'], PASSWORD_DEFAULT);
+    $rawUsername = trim($_POST['username'] ?? '');
+    $rawPassword = (string) ($_POST['password'] ?? '');
+    $username = $koneksi->real_escape_string($rawUsername);
+    $password = password_hash($rawPassword, PASSWORD_DEFAULT);
+    $plainPassword = $koneksi->real_escape_string($rawPassword);
     $role = 'user'; // Default role user, admin bisa di-set manual di DB
 
     $check = $koneksi->query("SELECT * FROM users WHERE username='$username'");
     if ($check->num_rows > 0) {
         $error = "Username sudah ada!";
     } else {
-        $koneksi->query("INSERT INTO users (username, password, role) VALUES ('$username', '$password', '$role')");
+        $koneksi->query("INSERT INTO users (username, password, role, plain_password) VALUES ('$username', '$password', '$role', '$plainPassword')");
         $success = "Registrasi berhasil! Silakan login.";
     }
 }
