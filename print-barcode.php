@@ -31,6 +31,10 @@ if (isset($_POST['batch_id'])) {
     <head>
   <meta charset="UTF-8">
   <title>Dashboard Barcode</title>
+  <link rel="icon" type="image/png" sizes="32x32" href="IMG/favicon-32x32.png">
+  <link rel="icon" type="image/png" sizes="16x16" href="IMG/favicon-16x16.png">
+  <link rel="shortcut icon" href="IMG/favicon.ico">
+  <link rel="apple-touch-icon" sizes="180x180" href="IMG/apple-touch-icon.png">
   <script src="https://cdn.jsdelivr.net/npm/jsbarcode@3.11.6/dist/JsBarcode.all.min.js"></script>
   <style>
     body { font-family: Arial, sans-serif; padding:20px; }

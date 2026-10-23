@@ -1,6 +1,7 @@
 # Local checkpoints and temporary files
 _checkpoint_before_range_input/
 db_check.php
+scratch/
 
 # IDE and OS files
 .vscode/

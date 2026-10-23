@@ -5,15 +5,33 @@ if (!isset($_SESSION['username']) || $_SESSION['role'] !== 'admin') {
     exit;
 }
 
-$allowedMenus = ['pcb', 'ev_charger', 'nameplate', 'record', 'custom', 'setting'];
+$allowedMenus = ['pcb', 'ev_charger', 'ev_charger_sn', 'nameplate', 'record', 'custom', 'setting'];
 $requestedMenu = isset($_REQUEST['menu']) ? (string) $_REQUEST['menu'] : '';
 $menu = in_array($requestedMenu, $allowedMenus, true) ? $requestedMenu : 'pcb';
 $isEvChargerMenu = $menu === 'ev_charger';
+$isEvChargerSnMenu = $menu === 'ev_charger_sn';
 
 // ====== KONEKSI ======
 $koneksi = new mysqli("192.168.88.254:3307", "root", "", "test");
 if ($koneksi->connect_errno) {
     die("Koneksi gagal: " . $koneksi->connect_error);
+}
+
+// ====== AJAX SAVE EV SN LOG HANDLER ======
+if (isset($_POST['action']) && $_POST['action'] === 'save_ev_sn_log') {
+    header('Content-Type: application/json');
+    $totalPrinted = (int)($_POST['total_printed'] ?? 0);
+    $startSn = $koneksi->real_escape_string(trim((string)($_POST['start_sn'] ?? '')));
+    $endSn = $koneksi->real_escape_string(trim((string)($_POST['end_sn'] ?? '')));
+    $prodDate = $koneksi->real_escape_string(trim((string)($_POST['prod_date'] ?? '')));
+    $username = isset($_SESSION['username']) ? $koneksi->real_escape_string($_SESSION['username']) : 'system';
+
+    if ($totalPrinted > 0) {
+        $koneksi->query("INSERT INTO ev_charger_sn_log_print (total_printed, start_sn, end_sn, prod_date, printed_at, username)
+                         VALUES ($totalPrinted, '$startSn', '$endSn', '$prodDate', NOW(), '$username')");
+    }
+    echo json_encode(['success' => true]);
+    exit;
 }
 
 $pcbBatchTable = $isEvChargerMenu ? 'ev_charger_batch' : 'batch';
@@ -52,9 +70,13 @@ $koneksi->query(
         nomor VARCHAR(100) NOT NULL,
         wo VARCHAR(100) NOT NULL,
         batch_id INT DEFAULT NULL,
+        is_printed TINYINT(1) NOT NULL DEFAULT 0,
+        printed_at TIMESTAMP NULL DEFAULT NULL,
+        printed_by VARCHAR(100) DEFAULT NULL,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         INDEX idx_wo (wo),
-        INDEX idx_batch_id (batch_id)
+        INDEX idx_batch_id (batch_id),
+        INDEX idx_batch_printed (batch_id, is_printed)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
 );
 $koneksi->query(
@@ -100,8 +122,20 @@ $koneksi->query(
         wo VARCHAR(100) NOT NULL,
         printed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         username VARCHAR(100) DEFAULT NULL,
-        UNIQUE KEY uniq_batch_id (batch_id),
+        INDEX idx_batch_id (batch_id),
         INDEX idx_wo (wo)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
+);
+$koneksi->query(
+    "CREATE TABLE IF NOT EXISTS ev_charger_sn_log_print (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        total_printed INT NOT NULL,
+        start_sn VARCHAR(100) DEFAULT NULL,
+        end_sn VARCHAR(100) DEFAULT NULL,
+        prod_date VARCHAR(100) DEFAULT NULL,
+        printed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        username VARCHAR(100) DEFAULT NULL,
+        INDEX idx_printed_at (printed_at)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
 );
 $koneksi->query(
@@ -134,6 +168,20 @@ foreach ($checkCols as $tbl) {
             $koneksi->query("ALTER TABLE `$tbl` ADD COLUMN username VARCHAR(100) DEFAULT NULL");
         }
     }
+}
+
+// Upgrade schema for EV Charger Custom Range Print
+$evPrintColExists = $koneksi->query("SHOW COLUMNS FROM `ev_charger_nomor_barcode` LIKE 'is_printed'");
+if ($evPrintColExists && $evPrintColExists->num_rows === 0) {
+    $koneksi->query("ALTER TABLE `ev_charger_nomor_barcode` ADD COLUMN is_printed TINYINT(1) NOT NULL DEFAULT 0");
+    $koneksi->query("ALTER TABLE `ev_charger_nomor_barcode` ADD COLUMN printed_at TIMESTAMP NULL DEFAULT NULL");
+    $koneksi->query("ALTER TABLE `ev_charger_nomor_barcode` ADD COLUMN printed_by VARCHAR(100) DEFAULT NULL");
+    $koneksi->query("ALTER TABLE `ev_charger_nomor_barcode` ADD INDEX idx_batch_printed (batch_id, is_printed)");
+}
+$evUniqIdxRes = $koneksi->query("SHOW INDEX FROM `ev_charger_log_print` WHERE Key_name = 'uniq_batch_id' AND Non_unique = 0");
+if ($evUniqIdxRes && $evUniqIdxRes->num_rows > 0) {
+    $koneksi->query("ALTER TABLE `ev_charger_log_print` DROP INDEX `uniq_batch_id`");
+    $koneksi->query("ALTER TABLE `ev_charger_log_print` ADD INDEX idx_batch_id (batch_id)");
 }
 
 function loadEvChargerTypeOptions(mysqli $koneksi, $filePath)
@@ -892,7 +940,7 @@ if (isset($_POST['split']) && !empty($_POST['wo_selected'])) {
         $ids[] = (int) $row['id'];
     }
 
-    $batchSize = 999;
+    $batchSize = $isEvChargerMenu ? 50000 : 999;
     $batchNum = 1;
     for ($i = 0; $i < count($ids); $i += $batchSize) {
         $nama_batch = "Batch $batchNum - $wo";
@@ -1008,52 +1056,98 @@ if (isset($_POST['print']) || isset($_POST['print_ev_charger'])) {
     $dateInput = isset($_POST['date']) && preg_match('/^\d{4}-\d{2}-\d{2}$/', (string) $_POST['date'])
         ? (string) $_POST['date']
         : date('Y-m-d');
-    $requestedEvPageCount = $isEvChargerPrint && isset($_POST['ev_page_count'])
-        ? max(1, (int) $_POST['ev_page_count'])
-        : null;
+    $printedRowIds = [];
     if ($isEvChargerPrint) {
         $evTypeName = isset($_POST['ev_type_name']) ? $koneksi->real_escape_string($_POST['ev_type_name']) : '';
         $date = date('d-m-y', strtotime($dateInput));
         $customText = trim(preg_replace('/\s+/', ' ', $evTypeName . ' ' . $date));
+
+        $evStart = trim((string) ($_POST['ev_start_number'] ?? ''));
+        $evEnd = trim((string) ($_POST['ev_end_number'] ?? ''));
+
+        // Load all numbers for this batch in order
+        $res = $koneksi->query("SELECT id, nomor, is_printed FROM ev_charger_nomor_barcode WHERE batch_id=$batch_id ORDER BY id ASC");
+        $allBatchRows = [];
+        $unprintedRows = [];
+        while ($r = $res->fetch_assoc()) {
+            $allBatchRows[] = $r;
+            if ((int)$r['is_printed'] === 0) {
+                $unprintedRows[] = $r;
+            }
+        }
+
+        if ($evStart === '' && !empty($unprintedRows)) {
+            $evStart = $unprintedRows[0]['nomor'];
+        }
+        if ($evEnd === '' && !empty($unprintedRows)) {
+            $evEnd = end($unprintedRows)['nomor'];
+        }
+
+        $startIndex = -1;
+        $endIndex = -1;
+        foreach ($allBatchRows as $idx => $row) {
+            if ($row['nomor'] === $evStart && $startIndex === -1) {
+                $startIndex = $idx;
+            }
+            if ($row['nomor'] === $evEnd) {
+                $endIndex = $idx;
+            }
+        }
+
+        $printError = null;
+        if ($startIndex === -1 || $endIndex === -1) {
+            $printError = "Nomor awal atau nomor akhir tidak ditemukan dalam batch ini.";
+        } elseif ($startIndex > $endIndex) {
+            $printError = "Nomor akhir harus lebih besar atau sama dengan nomor awal.";
+        } else {
+            // Admin is allowed to print duplicates
+            $selectedRows = array_slice($allBatchRows, $startIndex, ($endIndex - $startIndex + 1));
+        }
+
+        if ($printError) {
+            echo "<script>alert(" . json_encode($printError) . "); window.history.back();</script>";
+            exit;
+        }
+
+        $numbers = array_column($selectedRows, 'nomor');
+        $printedRowIds = array_column($selectedRows, 'id');
     } else {
         $type_meter = isset($_POST['type_meter']) ? $koneksi->real_escape_string($_POST['type_meter']) : '';
         $date = date('d-m-Y', strtotime($dateInput));
         $customText = $type_meter . ' ' . $date . ' Batch ' . $batch_num;
-    }
 
-    $res = $koneksi->query("SELECT nomor FROM {$pcbNumberTable} WHERE batch_id=$batch_id ORDER BY id ASC");
-    $numbers = [];
-    while ($r = $res->fetch_assoc()) {
-        $numbers[] = $r['nomor'];
+        $res = $koneksi->query("SELECT nomor FROM nomor_barcode WHERE batch_id=$batch_id ORDER BY id ASC");
+        $numbers = [];
+        while ($r = $res->fetch_assoc()) {
+            $numbers[] = $r['nomor'];
+        }
     }
 
     if (!empty($numbers)) {
         $chunks = array_chunk($numbers, 9);
         $totalChunkCount = count($chunks);
-        if ($isEvChargerPrint && $requestedEvPageCount !== null) {
-            $requestedEvPageCount = min($requestedEvPageCount, $totalChunkCount);
-            $chunks = array_slice($chunks, 0, $requestedEvPageCount);
-        }
-        $printedNumbers = [];
-        foreach ($chunks as $chunkNumbers) {
-            foreach ($chunkNumbers as $chunkNumber) {
-                $printedNumbers[] = $chunkNumber;
-            }
-        }
-        $isPartialEvPrint = $isEvChargerPrint && $requestedEvPageCount !== null && $requestedEvPageCount < $totalChunkCount;
-        if ($recordBatch && !empty($printedNumbers) && !$isPartialEvPrint) {
+
+        $printedNumbers = $numbers;
+
+        if ($recordBatch && !empty($printedNumbers)) {
             $startPrinted = $koneksi->real_escape_string($printedNumbers[0]);
             $endPrinted = $koneksi->real_escape_string($printedNumbers[count($printedNumbers) - 1]);
             $username = isset($_SESSION['username']) ? $koneksi->real_escape_string($_SESSION['username']) : 'system';
             if ($isEvChargerPrint) {
                 $safeWo = $koneksi->real_escape_string($wo);
-                $sql = "INSERT IGNORE INTO ev_charger_log_print (start_number, end_number, batch_id, nama_batch, wo, printed_at, username)
+                $sql = "INSERT INTO ev_charger_log_print (start_number, end_number, batch_id, nama_batch, wo, printed_at, username)
                         VALUES ('$startPrinted','$endPrinted','$batch_id','$nama_batch','$safeWo',NOW(),'$username')";
+                $koneksi->query($sql);
+
+                if (!empty($printedRowIds)) {
+                    $inIds = implode(',', array_map('intval', $printedRowIds));
+                    $koneksi->query("UPDATE ev_charger_nomor_barcode SET is_printed=1, printed_at=NOW(), printed_by='$username' WHERE id IN ($inIds)");
+                }
             } else {
                 $sql = "INSERT INTO log_print (start_number, end_number, batch_id, nama_batch, printed_at, username)
                         VALUES ('$startPrinted','$endPrinted','$batch_id','$nama_batch',NOW(),'$username')";
+                $koneksi->query($sql);
             }
-            $koneksi->query($sql);
         }
         ob_start();
 ?>
@@ -1612,31 +1706,77 @@ $pcbTotalPages = 0;
 $start = '';
 $end = '';
 $isPrinted = false;
+$isFullyPrinted = false;
+$allNumbers = [];
+$unprintedNumbers = [];
+$printedNumbers = [];
+$totalBatchCount = 0;
+$printedCount = 0;
+$unprintedCount = 0;
+$defaultEvStart = '';
+$defaultEvEnd = '';
+$defaultEvQty = 0;
 $pcbPrintLogTable = $isEvChargerMenu ? 'ev_charger_log_print' : 'log_print';
+
 if ($selectedBatchId) {
     $batchMetaPcbRes = $koneksi->query("SELECT nama_batch FROM {$pcbBatchTable} WHERE id=$selectedBatchId LIMIT 1");
     $batchMetaPcb = $batchMetaPcbRes ? $batchMetaPcbRes->fetch_assoc() : null;
     if ($batchMetaPcb && preg_match('/Batch (\d+)/', (string) $batchMetaPcb['nama_batch'], $pcbBatchMatches)) {
         $pcbBatchLabel = 'Batch ' . $pcbBatchMatches[1];
     }
-    $res = $koneksi->query("SELECT nomor, wo FROM {$pcbNumberTable} WHERE batch_id=$selectedBatchId ORDER BY id ASC");
-    $numbers = [];
-    while ($r = $res->fetch_assoc()) {
-        $numbers[] = $r['nomor'];
-        $woBatch = $r['wo'];
-    }
-    if (count($numbers) > 0) {
-        $pcbTotalPages = (int) ceil(count($numbers) / 9);
-        $awal9 = array_slice($numbers, 0, 9);
-        $akhir9 = array_slice($numbers, -9);
-        $start = $numbers[0];
-        $end = end($numbers);
-    }
 
-    $checkPrint = $koneksi->query("SELECT COUNT(*) as cnt FROM {$pcbPrintLogTable} WHERE batch_id=$selectedBatchId");
-    $printRow = $checkPrint->fetch_assoc();
-    if ($printRow['cnt'] > 0) {
-        $isPrinted = true;
+    if ($isEvChargerMenu) {
+        $res = $koneksi->query("SELECT id, nomor, wo, is_printed, printed_at, printed_by FROM ev_charger_nomor_barcode WHERE batch_id=$selectedBatchId ORDER BY id ASC");
+        while ($r = $res->fetch_assoc()) {
+            $num = $r['nomor'];
+            $woBatch = $r['wo'];
+            $allNumbers[] = $num;
+            if ((int) $r['is_printed'] === 1) {
+                $printedNumbers[] = $num;
+            } else {
+                $unprintedNumbers[] = $num;
+            }
+        }
+
+        $totalBatchCount = count($allNumbers);
+        $printedCount = count($printedNumbers);
+        $unprintedCount = count($unprintedNumbers);
+        $isFullyPrinted = ($totalBatchCount > 0 && $unprintedCount === 0);
+        $isPrinted = $isFullyPrinted;
+
+        // Preview numbers: use unprinted numbers if available, else all numbers
+        $previewSource = !empty($unprintedNumbers) ? $unprintedNumbers : $allNumbers;
+        if (!empty($previewSource)) {
+            $awal9 = array_slice($previewSource, 0, 9);
+            $akhir9 = array_slice($previewSource, -9);
+            $start = $previewSource[0];
+            $end = end($previewSource);
+        }
+        $pcbTotalPages = (int) ceil($unprintedCount / 9);
+
+        $defaultEvStart = !empty($unprintedNumbers) ? $unprintedNumbers[0] : (!empty($allNumbers) ? $allNumbers[0] : '');
+        $defaultEvEnd = !empty($unprintedNumbers) ? end($unprintedNumbers) : (!empty($allNumbers) ? end($allNumbers) : '');
+        $defaultEvQty = $unprintedCount > 0 ? $unprintedCount : $totalBatchCount;
+    } else {
+        $res = $koneksi->query("SELECT nomor, wo FROM {$pcbNumberTable} WHERE batch_id=$selectedBatchId ORDER BY id ASC");
+        $numbers = [];
+        while ($r = $res->fetch_assoc()) {
+            $numbers[] = $r['nomor'];
+            $woBatch = $r['wo'];
+        }
+        if (count($numbers) > 0) {
+            $pcbTotalPages = (int) ceil(count($numbers) / 9);
+            $awal9 = array_slice($numbers, 0, 9);
+            $akhir9 = array_slice($numbers, -9);
+            $start = $numbers[0];
+            $end = end($numbers);
+        }
+
+        $checkPrint = $koneksi->query("SELECT COUNT(*) as cnt FROM {$pcbPrintLogTable} WHERE batch_id=$selectedBatchId");
+        $printRow = $checkPrint->fetch_assoc();
+        if ($printRow['cnt'] > 0) {
+            $isPrinted = true;
+        }
     }
 }
 
@@ -1685,12 +1825,27 @@ while ($evChargerRecordRes && $recordRowEv = $evChargerRecordRes->fetch_assoc())
     $evChargerRecordRows[] = $recordRowEv;
 }
 
+$evSnRecordRes = $koneksi->query("SELECT total_printed, start_sn, end_sn, prod_date, printed_at, username FROM ev_charger_sn_log_print ORDER BY printed_at DESC LIMIT 200");
+$evSnRecordRows = [];
+while ($evSnRecordRes && $recordRowSn = $evSnRecordRes->fetch_assoc()) {
+    $evSnRecordRows[] = [
+        'nama_batch' => "SN EV ({$recordRowSn['total_printed']} pcs - {$recordRowSn['prod_date']})",
+        'printed_at' => $recordRowSn['printed_at'],
+        'start_number' => $recordRowSn['start_sn'],
+        'end_number' => $recordRowSn['end_sn'],
+        'username' => $recordRowSn['username']
+    ];
+}
+
 if ($recordType === 'nameplate') {
     $activeRecordRows = $nameplateRecordRows;
     $activeRecordLabel = 'Nameplate';
 } elseif ($recordType === 'ev_charger') {
     $activeRecordRows = $evChargerRecordRows;
     $activeRecordLabel = 'EV Charger';
+} elseif ($recordType === 'ev_charger_sn') {
+    $activeRecordRows = $evSnRecordRows;
+    $activeRecordLabel = 'SN EV Charger';
 } else {
     $activeRecordRows = $pcbRecordRows;
     $activeRecordLabel = 'PCB';
@@ -1702,6 +1857,10 @@ if ($recordType === 'nameplate') {
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>PCB Barcode Print</title>
+  <link rel="icon" type="image/png" sizes="32x32" href="IMG/favicon-32x32.png">
+  <link rel="icon" type="image/png" sizes="16x16" href="IMG/favicon-16x16.png">
+  <link rel="shortcut icon" href="IMG/favicon.ico">
+  <link rel="apple-touch-icon" sizes="180x180" href="IMG/apple-touch-icon.png">
   <script src="JS2/JsBarcode.all.min.js"></script>
   <script src="JS2/qrcode-generator.min.js"></script>
   <script src="JS2/qrcode-offline.js"></script>
@@ -1796,28 +1955,40 @@ if ($recordType === 'nameplate') {
   </script>
   <style>
     :root {
-      --bg: #0b1f3a;
-      --panel: #102a4d;
-      --panel-soft: #163763;
-      --text: #ffffff;
-      --muted: #dbe7ff;
-      --line: #2c4e7d;
-      --line-strong: #5f80b2;
-      --accent: #ffffff;
-      --accent-text: #0b1f3a;
-      --sidebar: #081a32;
-      --button: #123968;
-      --button-hover: #1a4b84;
-      --content-bg: linear-gradient(180deg, #eff5fc 0%, #e7eff9 100%);
-      --content-panel: rgba(245, 248, 253, 0.98);
-      --content-panel-soft: #edf4fd;
-      --content-text: #102847;
-      --content-muted: #5d7597;
-      --content-line: #c8d7eb;
-      --content-line-strong: #9fb5d4;
-      --content-button: #123968;
-      --content-button-hover: #1a4b84;
+      --bg: #091426;
+      --panel: #11223b;
+      --panel-soft: #172d4c;
+      --text: #f1f5f9;
+      --muted: #94a3b8;
+      --line: #1d3558;
+      --line-strong: #2c5082;
+      --accent: #38bdf8;
+      --accent-text: #091426;
+      --sidebar: #091322;
+      --button: #163660;
+      --button-hover: #1f4a82;
+      --content-bg: linear-gradient(180deg, #0b172a 0%, #0d1e36 100%);
+      --content-panel: #11223b;
+      --content-panel-soft: #162c4c;
+      --content-text: #f1f5f9;
+      --content-muted: #94a3b8;
+      --content-line: #1d385e;
+      --content-line-strong: #2a5084;
+      --content-button: #0284c7;
+      --content-button-hover: #0369a1;
       --content-button-text: #ffffff;
+      --card-shadow: 0 12px 32px rgba(0, 0, 0, 0.35);
+      --table-header-bg: #173863;
+      --table-header-text: #f8fafc;
+      --table-row-even: #142844;
+      --table-row-hover: #1c365c;
+      --table-border: #1d385e;
+      --badge-admin-bg: rgba(56, 189, 248, 0.15);
+      --badge-admin-text: #38bdf8;
+      --badge-admin-border: rgba(56, 189, 248, 0.35);
+      --badge-user-bg: rgba(148, 163, 184, 0.15);
+      --badge-user-text: #cbd5e1;
+      --badge-user-border: rgba(148, 163, 184, 0.3);
     }
 
     * {
@@ -1832,28 +2003,40 @@ if ($recordType === 'nameplate') {
     }
 
     body.light-theme {
-      --bg: #eef3fb;
+      --bg: #f8fafc;
       --panel: #ffffff;
-      --panel-soft: #f4f8ff;
-      --text: #0b1f3a;
-      --muted: #35527a;
-      --line: #c6d6ea;
-      --line-strong: #8da8cc;
-      --accent: #0b1f3a;
+      --panel-soft: #f1f5f9;
+      --text: #0f172a;
+      --muted: #64748b;
+      --line: #e2e8f0;
+      --line-strong: #cbd5e1;
+      --accent: #0284c7;
       --accent-text: #ffffff;
-      --sidebar: #dce8f7;
-      --button: #e7eef9;
-      --button-hover: #d7e3f5;
-      --content-bg: linear-gradient(180deg, #f7faff 0%, #eef4fc 100%);
+      --sidebar: #ffffff;
+      --button: #f1f5f9;
+      --button-hover: #e2e8f0;
+      --content-bg: linear-gradient(180deg, #f8fafc 0%, #edf2f7 100%);
       --content-panel: #ffffff;
-      --content-panel-soft: #f5f9ff;
-      --content-text: #102847;
-      --content-muted: #5d7597;
-      --content-line: #d5e0ef;
-      --content-line-strong: #a9bdd8;
-      --content-button: #123968;
-      --content-button-hover: #1a4b84;
+      --content-panel-soft: #f8fafc;
+      --content-text: #0f172a;
+      --content-muted: #64748b;
+      --content-line: #e2e8f0;
+      --content-line-strong: #cbd5e1;
+      --content-button: #0284c7;
+      --content-button-hover: #0369a1;
       --content-button-text: #ffffff;
+      --card-shadow: 0 8px 24px rgba(15, 23, 42, 0.06);
+      --table-header-bg: #0f2d59;
+      --table-header-text: #ffffff;
+      --table-row-even: #f8fafc;
+      --table-row-hover: #f1f5f9;
+      --table-border: #e2e8f0;
+      --badge-admin-bg: rgba(2, 132, 199, 0.12);
+      --badge-admin-text: #0284c7;
+      --badge-admin-border: rgba(2, 132, 199, 0.3);
+      --badge-user-bg: rgba(100, 116, 139, 0.12);
+      --badge-user-text: #475569;
+      --badge-user-border: rgba(100, 116, 139, 0.25);
     }
 
     .theme-toggle {
@@ -1864,15 +2047,22 @@ if ($recordType === 'nameplate') {
       border: 1px solid var(--line-strong);
       background: var(--button);
       color: var(--text);
-      padding: 8px 12px;
-      font-size: 12px;
-      font-weight: bold;
+      padding: 8px 14px;
+      font-size: 12.5px;
+      font-weight: 600;
       cursor: pointer;
-      letter-spacing: 0.03em;
+      letter-spacing: 0.02em;
+      border-radius: 999px;
+      box-shadow: 0 4px 14px rgba(0, 0, 0, 0.16);
+      transition: all 0.2s ease;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
     }
 
     .theme-toggle:hover {
       background: var(--button-hover);
+      transform: translateY(-1px);
     }
 
     .app-shell {
@@ -1950,45 +2140,364 @@ if ($recordType === 'nameplate') {
       background: var(--button-hover);
     }
 
+    nav {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+
     .nav-link {
-      display: block;
-      padding: 12px 14px;
-      border: 1px solid var(--line);
+      display: flex;
+      align-items: center;
+      gap: 11px;
+      padding: 10px 14px;
+      border: none;
+      border-radius: 8px;
       text-decoration: none;
-      color: var(--text);
-      margin-bottom: 10px;
-      font-size: 14px;
-      transition: 0.2s ease;
+      color: #94a3b8;
+      font-size: 13.5px;
+      font-weight: 500;
+      line-height: 1.3;
+      background: transparent;
+      transition: all 0.18s ease;
+      cursor: pointer;
+      box-sizing: border-box;
     }
 
     .nav-link:hover {
-      border-color: var(--line-strong);
-      background: var(--button);
+      background: rgba(255, 255, 255, 0.06);
+      color: #f8fafc;
     }
 
     .nav-link.active {
-      background: var(--accent);
-      color: var(--accent-text);
-      border-color: var(--accent);
-      font-weight: bold;
+      background: #199bf1;
+      color: #071b2d;
+      font-weight: 600;
+      box-shadow: 0 4px 14px rgba(25, 155, 241, 0.35);
     }
 
-    .sidebar-footer {
-      margin-top: auto;
+    .nav-link.active::after {
+      content: "";
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      background: #071b2d;
+      margin-left: auto;
+      flex-shrink: 0;
+    }
+
+    .nav-icon {
+      width: 18px;
+      height: 18px;
+      flex-shrink: 0;
+      stroke-width: 2;
+    }
+
+    .nav-link-text {
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .nav-dropdown {
+      display: flex;
+      flex-direction: column;
+      margin: 0;
+    }
+
+    .nav-dropdown-toggle {
+      display: flex;
+      align-items: center;
+      gap: 11px;
+      width: 100%;
+      padding: 10px 14px;
+      border: none;
+      border-radius: 8px;
+      background: transparent;
+      color: #94a3b8;
+      font-size: 13.5px;
+      font-weight: 500;
+      line-height: 1.3;
+      font-family: inherit;
+      cursor: pointer;
+      text-align: left;
+      transition: all 0.18s ease;
+      box-sizing: border-box;
+    }
+
+    .nav-dropdown-toggle:hover {
+      background: rgba(255, 255, 255, 0.06);
+      color: #f8fafc;
+    }
+
+    .nav-dropdown.open > .nav-dropdown-toggle {
+      color: #f8fafc;
+    }
+
+    .nav-dropdown-caret {
+      width: 14px;
+      height: 14px;
+      margin-left: auto;
+      flex-shrink: 0;
+      stroke-width: 2.2;
+      color: #64748b;
+      transition: transform 0.2s ease, color 0.18s ease;
+    }
+
+    .nav-dropdown.open .nav-dropdown-caret {
+      transform: rotate(90deg);
+      color: #cbd5e1;
+    }
+
+    .nav-dropdown-menu {
+      display: none;
+      flex-direction: column;
+      gap: 2px;
+      margin: 4px 0 6px 18px;
+      padding: 2px 0 2px 14px;
+      border-left: 1.5px solid rgba(148, 163, 184, 0.22);
+    }
+
+    .nav-dropdown.open .nav-dropdown-menu {
+      display: flex;
+    }
+
+    .nav-sub-link {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 8px 12px;
+      border: none;
+      border-radius: 6px;
+      text-decoration: none;
+      color: #8fa0b5;
+      font-size: 13px;
+      font-weight: 500;
+      line-height: 1.3;
+      background: transparent;
+      transition: all 0.18s ease;
+      box-sizing: border-box;
+    }
+
+    .nav-sub-link:hover {
+      background: rgba(255, 255, 255, 0.06);
+      color: #f8fafc;
+    }
+
+    .nav-sub-link.active {
+      background: #199bf1;
+      color: #071b2d;
+      font-weight: 600;
+      box-shadow: 0 4px 12px rgba(25, 155, 241, 0.28);
+    }
+
+    .nav-sub-link.active::after {
+      content: "";
+      width: 5px;
+      height: 5px;
+      border-radius: 50%;
+      background: #071b2d;
+      margin-left: auto;
+      flex-shrink: 0;
+    }
+
+    .sub-icon {
+      width: 15px;
+      height: 15px;
+      flex-shrink: 0;
+      stroke-width: 2;
+      opacity: 0.85;
+    }
+
+    .nav-divider {
+      height: 1px;
+      background: var(--line);
+      margin: 8px 4px;
+      opacity: 0.6;
     }
 
     .logout-link {
-      display: block;
-      padding: 10px 12px;
-      text-align: center;
-      border: 1px solid var(--line-strong);
+      display: flex;
+      align-items: center;
+      gap: 11px;
+      padding: 10px 14px;
+      border-radius: 8px;
+      border: 1px solid rgba(239, 68, 68, 0.25);
+      background: rgba(239, 68, 68, 0.08);
       text-decoration: none;
-      color: var(--text);
-      font-size: 14px;
+      color: #f87171;
+      font-size: 13.5px;
+      font-weight: 600;
+      line-height: 1.3;
+      transition: all 0.18s ease;
+      box-sizing: border-box;
+      cursor: pointer;
     }
 
     .logout-link:hover {
-      background: var(--button);
+      background: rgba(239, 68, 68, 0.2);
+      border-color: rgba(239, 68, 68, 0.5);
+      color: #ffffff;
+      transform: translateY(-1px);
+    }
+
+    .logout-link .nav-icon {
+      width: 18px;
+      height: 18px;
+      flex-shrink: 0;
+    }
+
+    body.light-theme .sidebar {
+      background: #ffffff;
+      border-right-color: #e2e8f0;
+    }
+
+    body.light-theme .sidebar-header .brand {
+      border-color: transparent;
+    }
+
+    body.light-theme .sidebar-toggle {
+      border-color: #cbd5e1;
+      background: #f1f5f9;
+      color: #0f172a;
+    }
+
+    body.light-theme .sidebar-toggle:hover {
+      background: #e2e8f0;
+    }
+
+    body.light-theme .nav-divider {
+      background: #e2e8f0;
+    }
+
+    body.light-theme .nav-link,
+    body.light-theme .nav-dropdown-toggle {
+      color: #475569;
+    }
+
+    body.light-theme .nav-link:hover,
+    body.light-theme .nav-dropdown-toggle:hover {
+      background: #f1f5f9;
+      color: #0f172a;
+    }
+
+    body.light-theme .nav-dropdown.open > .nav-dropdown-toggle {
+      color: #0f172a;
+    }
+
+    body.light-theme .nav-dropdown-caret {
+      color: #94a3b8;
+    }
+
+    body.light-theme .nav-dropdown.open .nav-dropdown-caret {
+      color: #334155;
+    }
+
+    body.light-theme .nav-dropdown-menu {
+      border-left-color: #cbd5e1;
+    }
+
+    body.light-theme .nav-sub-link {
+      color: #64748b;
+    }
+
+    body.light-theme .nav-sub-link:hover {
+      background: #f1f5f9;
+      color: #0f172a;
+    }
+
+    body.light-theme .nav-link.active,
+    body.light-theme .nav-sub-link.active {
+      background: linear-gradient(135deg, #0284c7, #0369a1);
+      color: #ffffff;
+      box-shadow: 0 4px 12px rgba(2, 132, 199, 0.28);
+    }
+
+    body.light-theme .nav-link.active::after,
+    body.light-theme .nav-sub-link.active::after {
+      background: #ffffff;
+    }
+
+    body.light-theme .logout-link {
+      border-color: rgba(220, 38, 38, 0.25);
+      background: rgba(220, 38, 38, 0.06);
+      color: #dc2626;
+    }
+
+    body.light-theme .logout-link:hover {
+      background: rgba(220, 38, 38, 0.14);
+      border-color: rgba(220, 38, 38, 0.45);
+      color: #b91c1c;
+      transform: translateY(-1px);
+    }
+
+    /* Badge & Button Utilities */
+    .badge-role {
+      display: inline-block;
+      padding: 3px 10px;
+      border-radius: 999px;
+      font-size: 11px;
+      font-weight: bold;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+    .badge-role-admin {
+      background: var(--badge-admin-bg);
+      color: var(--badge-admin-text);
+      border: 1px solid var(--badge-admin-border);
+    }
+    .badge-role-user {
+      background: var(--badge-user-bg);
+      color: var(--badge-user-text);
+      border: 1px solid var(--badge-user-border);
+    }
+
+    .btn-action-sm {
+      padding: 5px 12px;
+      font-size: 12px;
+      font-weight: 600;
+      border-radius: 8px;
+      background: var(--content-panel-soft);
+      border: 1px solid var(--content-line-strong);
+      color: var(--content-text);
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+    }
+    .btn-action-sm:hover {
+      background: var(--content-button-hover);
+      color: #ffffff;
+      border-color: var(--content-button-hover);
+    }
+
+    .btn-danger-sm {
+      padding: 5px 12px;
+      font-size: 12px;
+      font-weight: 600;
+      border-radius: 8px;
+      background: rgba(239, 68, 68, 0.12);
+      color: #f87171;
+      border: 1px solid rgba(239, 68, 68, 0.35);
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+    }
+    .btn-danger-sm:hover {
+      background: rgba(239, 68, 68, 0.22);
+      color: #ffffff;
+      border-color: rgba(239, 68, 68, 0.55);
+    }
+    body.light-theme .btn-danger-sm {
+      background: rgba(220, 38, 38, 0.08);
+      color: #dc2626;
+      border-color: rgba(220, 38, 38, 0.3);
+    }
+    body.light-theme .btn-danger-sm:hover {
+      background: rgba(220, 38, 38, 0.16);
+      color: #991b1b;
+      border-color: rgba(220, 38, 38, 0.5);
     }
 
     .main-content {
@@ -2382,13 +2891,14 @@ if ($recordType === 'nameplate') {
     }
 
     .label {
-      background: var(--content-panel-soft);
-      border: 1px dashed var(--content-line-strong);
+      background: #ffffff;
+      border: 1px solid var(--content-line-strong);
       padding: 8px;
       text-align: center;
-      color: var(--content-text);
+      color: #111111;
       overflow: hidden;
       border-radius: 14px;
+      box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
     }
 
     .label svg {
@@ -2541,9 +3051,10 @@ if ($recordType === 'nameplate') {
       background: #ffffff;
       border: 1px solid var(--content-line-strong);
       padding: 8px 10px;
-      color: var(--content-text);
+      color: #111111;
       min-height: 122px;
       border-radius: 16px;
+      box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
     }
 
 		    .np-body {
@@ -2575,7 +3086,7 @@ if ($recordType === 'nameplate') {
 		      font-size: 12px;
 		      font-weight: bold;
 		      margin-bottom: 6px;
-		      color: var(--content-text);
+		      color: #111111;
 		      line-height: 1;
 		      transform: translateY(2px);
 		    }
@@ -2609,7 +3120,7 @@ if ($recordType === 'nameplate') {
 		      font-family: "Century Gothic", Arial, sans-serif;
 		      font-weight: 600;
 		      letter-spacing: 0;
-		      color: var(--content-text);
+		      color: #111111;
 		      margin-top: 8px;
 		    }
 
@@ -2639,7 +3150,7 @@ if ($recordType === 'nameplate') {
 				      font-weight: 440;
 				      height: 31px;
 		      width: 132px;
-		      color: var(--content-text);
+		      color: #111111;
 		      line-height: 1;
 			      letter-spacing: 0.01em;
 			      white-space: nowrap;
@@ -2882,26 +3393,37 @@ if ($recordType === 'nameplate') {
     .record-table {
       width: 100%;
       border-collapse: collapse;
-      background: var(--content-panel-soft);
-      border: 1px solid var(--content-line-strong);
+      background: var(--content-panel);
+      border: 1px solid var(--table-border);
       color: var(--content-text);
+      border-radius: 12px;
+      overflow: hidden;
     }
 
     .record-table th,
     .record-table td {
-      border: 1px solid var(--content-line);
-      padding: 8px 7px;
-      font-size: 12px;
+      border: 1px solid var(--table-border);
+      padding: 9px 10px;
+      font-size: 12.5px;
       text-align: left;
-      vertical-align: top;
+      vertical-align: middle;
     }
 
     .record-table th {
-      background: var(--content-button);
-      color: var(--content-button-text);
+      background: var(--table-header-bg);
+      color: var(--table-header-text);
       font-size: 11px;
+      font-weight: 700;
       text-transform: uppercase;
       letter-spacing: 0.05em;
+    }
+
+    .record-table tbody tr:nth-child(even) td {
+      background: var(--table-row-even);
+    }
+
+    .record-table tbody tr:hover td {
+      background: var(--table-row-hover);
     }
 
     .record-empty {
@@ -3087,21 +3609,53 @@ if ($recordType === 'nameplate') {
       </div>
 
 	      <nav>
-	        <a class="nav-link <?= $menu === 'pcb' ? 'active' : '' ?>" href="view.php?menu=pcb">Print PCB Barcode</a>
-	        <a class="nav-link <?= $menu === 'ev_charger' ? 'active' : '' ?>" href="view.php?menu=ev_charger">Print PCB EV Chager</a>
-	        <a class="nav-link <?= $menu === 'nameplate' ? 'active' : '' ?>" href="view.php?menu=nameplate">Print Nameplate Barcode</a>
-	        <a class="nav-link <?= $menu === 'record' ? 'active' : '' ?>" href="view.php?menu=record">Record Print</a>
-	        <a class="nav-link <?= $menu === 'custom' ? 'active' : '' ?>" href="view.php?menu=custom">Custom Print</a>
-	        <a class="nav-link <?= $menu === 'setting' ? 'active' : '' ?>" href="view.php?menu=setting">Setting</a>
+	        <a class="nav-link <?= $menu === 'pcb' ? 'active' : '' ?>" href="view.php?menu=pcb">
+	          <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1.5"></rect><rect x="14" y="3" width="7" height="7" rx="1.5"></rect><rect x="14" y="14" width="7" height="7" rx="1.5"></rect><rect x="3" y="14" width="7" height="7" rx="1.5"></rect></svg>
+	          <span class="nav-link-text">Print PCB Barcode</span>
+	        </a>
+	        <div class="nav-dropdown <?= ($menu === 'ev_charger' || $menu === 'ev_charger_sn') ? 'open' : '' ?>">
+	          <button type="button" class="nav-dropdown-toggle">
+	            <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"></polygon></svg>
+	            <span class="nav-link-text">EV Charge</span>
+	            <svg class="nav-dropdown-caret" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"></polyline></svg>
+	          </button>
+	          <div class="nav-dropdown-menu">
+	            <a class="nav-sub-link <?= $menu === 'ev_charger' ? 'active' : '' ?>" href="view.php?menu=ev_charger">
+	              <svg class="nav-icon sub-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="4" width="16" height="16" rx="2"></rect><rect x="9" y="9" width="6" height="6"></rect><line x1="9" y1="1" x2="9" y2="4"></line><line x1="15" y1="1" x2="15" y2="4"></line><line x1="9" y1="20" x2="9" y2="23"></line><line x1="15" y1="20" x2="15" y2="23"></line><line x1="20" y1="9" x2="23" y2="9"></line><line x1="20" y1="14" x2="23" y2="14"></line><line x1="1" y1="9" x2="4" y2="9"></line><line x1="1" y1="14" x2="4" y2="14"></line></svg>
+	              <span class="nav-link-text">Print PCB EV Charge</span>
+	            </a>
+	            <a class="nav-sub-link <?= $menu === 'ev_charger_sn' ? 'active' : '' ?>" href="view.php?menu=ev_charger_sn">
+	              <svg class="nav-icon sub-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="6" height="6" rx="1"></rect><rect x="15" y="3" width="6" height="6" rx="1"></rect><rect x="3" y="15" width="6" height="6" rx="1"></rect><path d="M14 14h3v3h-3z"></path><path d="M20 14v6h-6"></path><path d="M17 17v3"></path></svg>
+	              <span class="nav-link-text">Print SN EV Charge</span>
+	            </a>
+	          </div>
+	        </div>
+	        <a class="nav-link <?= $menu === 'nameplate' ? 'active' : '' ?>" href="view.php?menu=nameplate">
+	          <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"></path><line x1="7" y1="7" x2="7.01" y2="7"></line></svg>
+	          <span class="nav-link-text">Print Nameplate Barcode</span>
+	        </a>
+	        <a class="nav-link <?= $menu === 'record' ? 'active' : '' ?>" href="view.php?menu=record">
+	          <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path><polyline points="14 2 14 8 20 8"></polyline><line x1="16" y1="13" x2="8" y2="13"></line><line x1="16" y1="17" x2="8" y2="17"></line><polyline points="10 9 9 9 8 9"></polyline></svg>
+	          <span class="nav-link-text">Record Print</span>
+	        </a>
+	        <a class="nav-link <?= $menu === 'custom' ? 'active' : '' ?>" href="view.php?menu=custom">
+	          <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="4" y1="21" x2="4" y2="14"></line><line x1="4" y1="10" x2="4" y2="3"></line><line x1="12" y1="21" x2="12" y2="12"></line><line x1="12" y1="8" x2="12" y2="3"></line><line x1="20" y1="21" x2="20" y2="16"></line><line x1="20" y1="12" x2="20" y2="3"></line><line x1="1" y1="14" x2="7" y2="14"></line><line x1="9" y1="8" x2="15" y2="8"></line><line x1="17" y1="16" x2="23" y2="16"></line></svg>
+	          <span class="nav-link-text">Custom Print</span>
+	        </a>
+	        <a class="nav-link <?= $menu === 'setting' ? 'active' : '' ?>" href="view.php?menu=setting">
+	          <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path></svg>
+	          <span class="nav-link-text">Setting</span>
+	        </a>
+	        <div class="nav-divider"></div>
+	        <a class="logout-link" href="Logout1.php">
+	          <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"></path><polyline points="16 17 21 12 16 7"></polyline><line x1="21" y1="12" x2="9" y2="12"></line></svg>
+	          <span>Logout</span>
+	        </a>
 	      </nav>
-
-      <div class="sidebar-footer">
-        <a class="logout-link" href="Logout1.php">Logout</a>
-      </div>
     </aside>
 
     <main class="main-content">
-      <button type="button" id="themeToggleBtn" class="theme-toggle" aria-label="Toggle Theme">Light Mode</button>
+      <button type="button" id="themeToggleBtn" class="theme-toggle" aria-label="Toggle Theme">&#9728;&#65039; Light Mode</button>
 	      <?php if ($menu === 'pcb' || $menu === 'ev_charger'): ?>
 	        <div class="topbar">
 	          <h1><?= $isEvChargerMenu ? 'Print PCB EV Chager' : 'Print PCB Barcode' ?></h1>
@@ -3421,10 +3975,30 @@ if ($recordType === 'nameplate') {
                       $id = (int) $batch['id'];
                       $sel = ($selectedBatchId == $id) ? 'selected' : '';
                       $label = htmlspecialchars($batch['nama_batch']);
-	                      $checkBatchPrint = $koneksi->query("SELECT COUNT(*) as cnt FROM {$pcbPrintLogTable} WHERE batch_id=$id");
-                      $batchPrintRow = $checkBatchPrint->fetch_assoc();
-                      if ($batchPrintRow['cnt'] > 0) {
-                          $label .= ' (Sudah di-print)';
+                      if ($isEvChargerMenu) {
+                          $statRes = $koneksi->query("SELECT 
+                              COUNT(*) AS total_cnt,
+                              SUM(CASE WHEN is_printed = 1 THEN 1 ELSE 0 END) AS printed_cnt,
+                              SUM(CASE WHEN is_printed = 0 THEN 1 ELSE 0 END) AS unprinted_cnt
+                              FROM ev_charger_nomor_barcode WHERE batch_id=$id");
+                          $statRow = $statRes ? $statRes->fetch_assoc() : null;
+                          $totalCnt = (int) ($statRow['total_cnt'] ?? 0);
+                          $printedCnt = (int) ($statRow['printed_cnt'] ?? 0);
+                          $unprintedCnt = (int) ($statRow['unprinted_cnt'] ?? 0);
+
+                          if ($totalCnt > 0 && $unprintedCnt === 0) {
+                              $label .= ' (Selesai di-print)';
+                          } elseif ($printedCnt > 0) {
+                              $label .= " (Sisa {$unprintedCnt} dari {$totalCnt} nomor)";
+                          } else {
+                              $label .= " ({$totalCnt} nomor, Belum di-print)";
+                          }
+                      } else {
+                          $checkBatchPrint = $koneksi->query("SELECT COUNT(*) as cnt FROM {$pcbPrintLogTable} WHERE batch_id=$id");
+                          $batchPrintRow = $checkBatchPrint->fetch_assoc();
+                          if ($batchPrintRow['cnt'] > 0) {
+                              $label .= ' (Sudah di-print)';
+                          }
                       }
                       echo "<option value='{$id}' {$sel}>{$label}</option>";
                   }
@@ -3462,41 +4036,107 @@ if ($recordType === 'nameplate') {
                 </div>
               </div>
 
-	              <?php if ($isPrinted): ?>
-	                <div class="warning-msg">Batch ini sudah di-print. Admin masih bisa print ulang jika diperlukan.</div>
+	              <?php if ($isEvChargerMenu): ?>
+	                <div class="ev-batch-status-box" style="margin-bottom: 16px; padding: 14px 18px; border-radius: 12px; background: var(--content-panel-soft); border: 1px solid var(--content-line-strong);">
+	                  <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px;">
+	                    <div>
+	                      <span style="font-size: 13px; color: var(--content-muted);">Total Barcode Batch:</span>
+	                      <strong style="margin-left: 6px; font-size: 15px;"><?= number_format($totalBatchCount, 0, ',', '.') ?></strong>
+	                    </div>
+	                    <div>
+	                      <span style="font-size: 13px; color: #10b981;">Sudah Tercetak:</span>
+	                      <strong style="margin-left: 6px; font-size: 15px; color: #10b981;"><?= number_format($printedCount, 0, ',', '.') ?></strong>
+	                    </div>
+	                    <div>
+	                      <span style="font-size: 13px; color: #3b82f6;">Sisa Belum Cetak:</span>
+	                      <strong style="margin-left: 6px; font-size: 15px; color: #3b82f6;"><?= number_format($unprintedCount, 0, ',', '.') ?></strong>
+	                    </div>
+	                  </div>
+	                  <?php if ($printedCount > 0 && !empty($printedNumbers)): ?>
+	                    <div style="margin-top: 10px; font-size: 12px; color: var(--content-muted); border-top: 1px dashed var(--content-line-strong); padding-top: 8px;">
+	                      <span style="color: #10b981; font-weight: 600;">&#10003; Tercetak:</span> <?= htmlspecialchars($printedNumbers[0]) ?> s/d <?= htmlspecialchars(end($printedNumbers)) ?> (<?= number_format($printedCount, 0, ',', '.') ?> nomor tercetak, Admin dapat cetak ulang)
+	                    </div>
+	                  <?php endif; ?>
+	                  <?php if ($unprintedCount > 0 && !empty($unprintedNumbers)): ?>
+	                    <div style="margin-top: 6px; font-size: 12px; color: #3b82f6;">
+	                      <span style="font-weight: 600;">&#9654; Tersedia untuk Cetak:</span> <?= htmlspecialchars($unprintedNumbers[0]) ?> s/d <?= htmlspecialchars(end($unprintedNumbers)) ?> (<?= number_format($unprintedCount, 0, ',', '.') ?> nomor)
+	                    </div>
+	                  <?php endif; ?>
+	                </div>
 	              <?php endif; ?>
-	              <form id="printForm" method="POST" data-is-printed="<?= $isPrinted ? '1' : '0' ?>">
+
+	              <?php if ($isPrinted): ?>
+	                <div class="warning-msg" style="<?= $isEvChargerMenu ? 'background: rgba(59, 130, 246, 0.1); border-color: #3b82f6; color: #2563eb;' : '' ?>">
+	                  <?= $isEvChargerMenu ? 'Batch ini sudah selesai di-print seluruhnya (' . number_format($totalBatchCount, 0, ',', '.') . ' nomor sudah tercetak). Sebagai Admin, Anda dapat melakukan print duplikat jika diperlukan.' : 'Batch ini sudah di-print. Admin masih bisa print ulang jika diperlukan.' ?>
+	                </div>
+	              <?php endif; ?>
+	              <form id="printForm" method="POST" data-is-printed="<?= $isPrinted ? '1' : '0' ?>" data-is-ev="<?= $isEvChargerMenu ? '1' : '0' ?>">
 	                <input type="hidden" name="menu" value="<?= htmlspecialchars($menu) ?>">
 	                <input type="hidden" name="batch_id" value="<?= $selectedBatchId ?>">
 	                <input type="hidden" name="wo" value="<?= htmlspecialchars($woBatch) ?>">
 	                <input type="hidden" name="start" value="<?= htmlspecialchars($start) ?>">
-                <input type="hidden" name="end" value="<?= htmlspecialchars($end) ?>">
+	                <input type="hidden" name="end" value="<?= htmlspecialchars($end) ?>">
 	                <input type="hidden" name="<?= $isEvChargerMenu ? 'print_ev_charger' : 'print' ?>" value="1">
 	                <input type="hidden" name="record_batch" id="recordBatchChoice" value="0">
-	                <label>Custom Text</label>
-		                <div class="custom-fields">
-		                  <?php if ($isEvChargerMenu): ?>
-		                    <select name="ev_type_name" required>
-		                      <option value=""><?= empty($evTypeOptions) ? 'Belum ada custom text EV' : 'Pilih Custom Text EV' ?></option>
-		                      <?php foreach ($evTypeOptions as $evTypeOption): ?>
-		                        <option value="<?= htmlspecialchars($evTypeOption) ?>"><?= htmlspecialchars($evTypeOption) ?></option>
-		                      <?php endforeach; ?>
-		                    </select>
-		                    <input type="number" name="ev_page_count" min="1" max="<?= max(1, $pcbTotalPages) ?>" value="<?= max(1, $pcbTotalPages) ?>" required>
-		                  <?php else: ?>
+
+	                <?php if ($isEvChargerMenu): ?>
+	                  <div style="margin-bottom: 16px; padding: 14px; border-radius: 10px; background: var(--content-panel-soft); border: 1px solid var(--content-line-strong);">
+	                    <label style="font-weight: 600; font-size: 14px; margin-bottom: 8px; display: block; color: var(--content-text);">Custom Range Print EV Charger</label>
+	                    <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px;">
+	                      <div>
+	                        <label style="font-size: 12px; margin-bottom: 4px;">Nomor Awal Print</label>
+	                        <input type="text" name="ev_start_number" id="evStartNumber" value="<?= htmlspecialchars($defaultEvStart) ?>" required style="margin-bottom: 0;">
+	                      </div>
+	                      <div>
+	                        <label style="font-size: 12px; margin-bottom: 4px;">Nomor Akhir Print</label>
+	                        <input type="text" name="ev_end_number" id="evEndNumber" value="<?= htmlspecialchars($defaultEvEnd) ?>" required style="margin-bottom: 0;">
+	                      </div>
+	                      <div>
+	                        <label style="font-size: 12px; margin-bottom: 4px;">Quantity (Jumlah Nomor)</label>
+	                        <input type="number" name="ev_print_qty" id="evPrintQty" min="1" max="<?= max(1, $totalBatchCount) ?>" value="<?= $defaultEvQty ?>" required style="margin-bottom: 0;">
+	                      </div>
+	                    </div>
+	                    <div style="display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px; margin-top: 10px;">
+	                      <div style="font-size: 12px; color: var(--content-muted);">
+	                        Estimasi: <strong id="evSheetsEstimate" style="color: var(--content-button-hover);"><?= (int) ceil($defaultEvQty / 9) ?> Lembar</strong> (3x3 = 9 barcode/lembar)
+	                      </div>
+	                      <div style="display: flex; gap: 6px; flex-wrap: wrap;">
+	                        <?php if ($unprintedCount > 0): ?>
+	                          <button type="button" id="btnEvQuickAll" style="font-size: 11px; padding: 4px 10px; border-radius: 6px; background: var(--content-panel); border: 1px solid var(--content-line-strong); cursor: pointer; color: var(--content-text);">Cetak Sisa (<?= $unprintedCount ?>)</button>
+	                        <?php endif; ?>
+	                        <button type="button" id="btnEvQuickFullBatch" style="font-size: 11px; padding: 4px 10px; border-radius: 6px; background: var(--content-panel); border: 1px solid var(--content-line-strong); cursor: pointer; color: var(--content-text);">Semua Batch (<?= $totalBatchCount ?>)</button>
+	                        <button type="button" id="btnEvQuick9" style="font-size: 11px; padding: 4px 10px; border-radius: 6px; background: var(--content-panel); border: 1px solid var(--content-line-strong); cursor: pointer; color: var(--content-text);">1 Lembar (9)</button>
+	                        <button type="button" id="btnEvQuick18" style="font-size: 11px; padding: 4px 10px; border-radius: 6px; background: var(--content-panel); border: 1px solid var(--content-line-strong); cursor: pointer; color: var(--content-text);">2 Lembar (18)</button>
+	                      </div>
+	                    </div>
+	                    <div id="evRangeError" style="display: none; margin-top: 8px; padding: 6px 12px; border-radius: 8px; font-size: 12px; border: 1px solid;"></div>
+	                  </div>
+
+	                  <label>Custom Text & Tanggal</label>
+	                  <div class="custom-fields">
+	                    <select name="ev_type_name" required>
+	                      <option value=""><?= empty($evTypeOptions) ? 'Belum ada custom text EV' : 'Pilih Custom Text EV' ?></option>
+	                      <?php foreach ($evTypeOptions as $evTypeOption): ?>
+	                        <option value="<?= htmlspecialchars($evTypeOption) ?>"><?= htmlspecialchars($evTypeOption) ?></option>
+	                      <?php endforeach; ?>
+	                    </select>
+	                    <input type="date" name="date" value="<?= date('Y-m-d') ?>" required>
+	                  </div>
+	                  <p class="status-msg" style="margin-top: 6px;">Pilih custom text EV Charger dan range nomor barcode yang akan dicetak. Sebagai Admin, Anda diizinkan melakukan print duplikat jika diperlukan.</p>
+	                <?php else: ?>
+	                  <label>Custom Text</label>
+	                  <div class="custom-fields">
 	                    <select name="type_meter" required>
 	                      <option value=""><?= empty($typeMeterOptions) ? 'Belum ada Type Meter' : 'Pilih Type Meter' ?></option>
 	                      <?php foreach ($typeMeterOptions as $typeMeterOption): ?>
 	                        <option value="<?= htmlspecialchars($typeMeterOption) ?>"><?= htmlspecialchars($typeMeterOption) ?></option>
 	                      <?php endforeach; ?>
 	                    </select>
-	                  <?php endif; ?>
-	                  <input type="date" name="date" value="<?= date('Y-m-d') ?>" required>
-	                </div>
-		                <?php if ($isEvChargerMenu): ?>
-		                  <p class="status-msg">Custom text EV Charger sekarang dipilih dari dropdown. Total page batch ini: <?= $pcbTotalPages ?>. Jika jumlah page dikurangi, print parsial tidak direcord.</p>
-		                <?php endif; ?>
-	                <button class="primary" type="button" id="printBtn">Print</button>
+	                    <input type="date" name="date" value="<?= date('Y-m-d') ?>" required>
+	                  </div>
+	                <?php endif; ?>
+
+	                <button class="primary" type="button" id="printBtn"><?= $isEvChargerMenu ? 'Print Barcode EV' : 'Print' ?></button>
 	              </form>
               <div id="recordConfirmModal" class="modal">
                 <div class="modal-content">
@@ -3523,13 +4163,199 @@ if ($recordType === 'nameplate') {
                     return;
                   }
 
+                  var isEvMode = printForm.dataset.isEv === "1";
+                  var evStartInput = document.getElementById("evStartNumber");
+                  var evEndInput = document.getElementById("evEndNumber");
+                  var evQtyInput = document.getElementById("evPrintQty");
+                  var evSheetsEstimate = document.getElementById("evSheetsEstimate");
+                  var evRangeError = document.getElementById("evRangeError");
+                  var btnQuickAll = document.getElementById("btnEvQuickAll");
+                  var btnQuickFullBatch = document.getElementById("btnEvQuickFullBatch");
+                  var btnQuick9 = document.getElementById("btnEvQuick9");
+                  var btnQuick18 = document.getElementById("btnEvQuick18");
+
+                  var allBatchList = <?= json_encode(array_values($allNumbers ?? [])) ?>;
+                  var unprintedList = <?= json_encode(array_values($unprintedNumbers ?? [])) ?>;
+                  var printedSet = new Set(<?= json_encode(array_values($printedNumbers ?? [])) ?>);
+                  var allMap = {};
+                  for (var i = 0; i < allBatchList.length; i++) {
+                    allMap[allBatchList[i]] = i;
+                  }
+
+                  var hasEvDuplicates = false;
+                  var evDuplicateCount = 0;
+
+                  function showEvNotice(msg, isError) {
+                    if (evRangeError) {
+                      evRangeError.textContent = msg;
+                      evRangeError.style.display = "block";
+                      if (isError) {
+                        evRangeError.style.background = "rgba(239, 68, 68, 0.12)";
+                        evRangeError.style.borderColor = "#ef4444";
+                        evRangeError.style.color = "#dc2626";
+                      } else {
+                        evRangeError.style.background = "rgba(245, 158, 11, 0.12)";
+                        evRangeError.style.borderColor = "#f59e0b";
+                        evRangeError.style.color = "#b45309";
+                      }
+                    }
+                    if (printBtn) {
+                      printBtn.disabled = isError;
+                      printBtn.style.opacity = isError ? "0.5" : "1";
+                    }
+                  }
+
+                  function clearEvNotice() {
+                    if (evRangeError) {
+                      evRangeError.style.display = "none";
+                      evRangeError.textContent = "";
+                    }
+                    if (printBtn) {
+                      printBtn.disabled = false;
+                      printBtn.style.opacity = "1";
+                    }
+                  }
+
+                  function validateEvRange() {
+                    if (!isEvMode) return true;
+                    if (!evStartInput || !evEndInput || !evQtyInput) return false;
+                    if (allBatchList.length === 0) {
+                      showEvNotice("Tidak ada data nomor barcode dalam batch ini.", true);
+                      return false;
+                    }
+
+                    var sVal = evStartInput.value.trim();
+                    var eVal = evEndInput.value.trim();
+
+                    if (!sVal || !eVal) {
+                      showEvNotice("Nomor awal dan nomor akhir wajib diisi.", true);
+                      return false;
+                    }
+
+                    if (allMap[sVal] === undefined) {
+                      showEvNotice("Nomor awal (" + sVal + ") tidak ditemukan dalam data batch ini.", true);
+                      return false;
+                    }
+                    if (allMap[eVal] === undefined) {
+                      showEvNotice("Nomor akhir (" + eVal + ") tidak ditemukan dalam data batch ini.", true);
+                      return false;
+                    }
+
+                    var sIdx = allMap[sVal];
+                    var eIdx = allMap[eVal];
+                    if (sIdx > eIdx) {
+                      showEvNotice("Nomor akhir harus berada setelah atau sama dengan nomor awal.", true);
+                      return false;
+                    }
+
+                    var count = eIdx - sIdx + 1;
+                    evQtyInput.value = count;
+                    var sheets = Math.ceil(count / 9);
+                    if (evSheetsEstimate) {
+                      var lastPageCount = count % 9 === 0 ? 9 : (count % 9);
+                      evSheetsEstimate.textContent = sheets + " Lembar (" + count + " barcode" + (sheets > 1 ? ", lembar terakhir: " + lastPageCount + " barcode" : "") + ")";
+                    }
+
+                    hasEvDuplicates = false;
+                    evDuplicateCount = 0;
+                    for (var idx = sIdx; idx <= eIdx; idx++) {
+                      var num = allBatchList[idx];
+                      if (printedSet.has(num)) {
+                        hasEvDuplicates = true;
+                        evDuplicateCount++;
+                      }
+                    }
+
+                    if (hasEvDuplicates) {
+                      showEvNotice("⚠️ Perhatian: Range ini mengandung " + evDuplicateCount + " nomor yang sudah pernah dicetak (Print Duplikat). Sebagai Admin, Anda dapat mencetak ulang nomor ini.", false);
+                    } else {
+                      clearEvNotice();
+                    }
+                    return true;
+                  }
+
+                  if (isEvMode) {
+                    if (evStartInput) evStartInput.addEventListener("input", validateEvRange);
+                    if (evEndInput) evEndInput.addEventListener("input", validateEvRange);
+                    if (evQtyInput) {
+                      evQtyInput.addEventListener("input", function () {
+                        var qty = parseInt(evQtyInput.value, 10);
+                        if (isNaN(qty) || qty < 1) return;
+                        var sVal = evStartInput.value.trim();
+                        if (allMap[sVal] === undefined) return;
+                        var sIdx = allMap[sVal];
+                        var targetIdx = sIdx + qty - 1;
+                        if (targetIdx < allBatchList.length) {
+                          evEndInput.value = allBatchList[targetIdx];
+                        } else {
+                          evEndInput.value = allBatchList[allBatchList.length - 1];
+                        }
+                        validateEvRange();
+                      });
+                    }
+
+                    if (btnQuickAll && unprintedList.length > 0) {
+                      btnQuickAll.addEventListener("click", function () {
+                        evStartInput.value = unprintedList[0];
+                        evEndInput.value = unprintedList[unprintedList.length - 1];
+                        validateEvRange();
+                      });
+                    }
+
+                    if (btnQuickFullBatch && allBatchList.length > 0) {
+                      btnQuickFullBatch.addEventListener("click", function () {
+                        evStartInput.value = allBatchList[0];
+                        evEndInput.value = allBatchList[allBatchList.length - 1];
+                        validateEvRange();
+                      });
+                    }
+
+                    var baseList = unprintedList.length > 0 ? unprintedList : allBatchList;
+                    if (btnQuick9 && baseList.length > 0) {
+                      btnQuick9.addEventListener("click", function () {
+                        evStartInput.value = baseList[0];
+                        var count = Math.min(9, baseList.length);
+                        evEndInput.value = baseList[count - 1];
+                        validateEvRange();
+                      });
+                    }
+                    if (btnQuick18 && baseList.length > 0) {
+                      btnQuick18.addEventListener("click", function () {
+                        evStartInput.value = baseList[0];
+                        var count = Math.min(18, baseList.length);
+                        evEndInput.value = baseList[count - 1];
+                        validateEvRange();
+                      });
+                    }
+
+                    validateEvRange();
+                  }
+
                   function openRecordModal() {
                     if (typeof printForm.reportValidity === "function" && !printForm.reportValidity()) {
                       return false;
                     }
+                    if (isEvMode && !validateEvRange()) {
+                      return false;
+                    }
 
                     var isPrinted = printForm.dataset.isPrinted === "1";
-                    if (isPrinted) {
+                    if (isEvMode) {
+                      var sVal = evStartInput ? evStartInput.value.trim() : "";
+                      var eVal = evEndInput ? evEndInput.value.trim() : "";
+                      var qVal = evQtyInput ? evQtyInput.value.trim() : "";
+                      if (hasEvDuplicates) {
+                        modalTitle.textContent = "Konfirmasi Print Duplikat EV Charger";
+                        modalMessage.textContent = "Terdapat " + evDuplicateCount + " nomor yang sudah pernah dicetak dalam range " + sVal + " s/d " + eVal + " (Total " + qVal + " barcode).\n\nSebagai Admin, Anda dapat mencetak ulang (duplikat). Lanjutkan cetak duplikat?";
+                        yesBtn.textContent = "Ya, Cetak Duplikat";
+                        noBtn.textContent = "Batal";
+                      } else {
+                        modalTitle.textContent = "Konfirmasi Record EV Charger";
+                        modalMessage.textContent = "Cetak dan record " + qVal + " barcode (" + sVal + " s/d " + eVal + ") ke database? Nomor yang direcord tidak dapat dicetak ulang oleh operator.";
+                        yesBtn.textContent = "Ya, Record & Cetak";
+                        noBtn.textContent = "Hanya Cetak (Tanpa Record)";
+                      }
+                    } else if (isPrinted) {
                       modalTitle.textContent = "Konfirmasi Print Ulang";
                       modalMessage.textContent = "Batch ini sudah print, yakin print ulang?";
                       yesBtn.textContent = "Ya";
@@ -3558,13 +4384,28 @@ if ($recordType === 'nameplate') {
                   });
 
                   yesBtn.addEventListener("click", function () {
-                    var isPrinted = printForm.dataset.isPrinted === "1";
-                    recordField.value = isPrinted ? "0" : "1";
+                    if (isEvMode) {
+                      recordField.value = "1";
+                    } else {
+                      var isPrinted = printForm.dataset.isPrinted === "1";
+                      recordField.value = isPrinted ? "0" : "1";
+                    }
                     printForm.dataset.confirmed = "1";
                     printForm.submit();
                   });
 
                   noBtn.addEventListener("click", function () {
+                    if (isEvMode) {
+                      if (hasEvDuplicates) {
+                        recordModal.style.display = "none";
+                        return;
+                      }
+                      recordField.value = "0";
+                      printForm.dataset.confirmed = "1";
+                      printForm.submit();
+                      return;
+                    }
+
                     var isPrinted = printForm.dataset.isPrinted === "1";
                     if (isPrinted) {
                       recordModal.style.display = "none";
@@ -3884,6 +4725,7 @@ if ($recordType === 'nameplate') {
                 <option value="pcb" <?= $recordType === 'pcb' ? 'selected' : '' ?>>Record PCB</option>
                 <option value="nameplate" <?= $recordType === 'nameplate' ? 'selected' : '' ?>>Record Nameplate</option>
                 <option value="ev_charger" <?= $recordType === 'ev_charger' ? 'selected' : '' ?>>Record EV Charger</option>
+                <option value="ev_charger_sn" <?= $recordType === 'ev_charger_sn' ? 'selected' : '' ?>>Record SN EV Charger</option>
               </select>
             </div>
           </form>
@@ -4177,6 +5019,126 @@ if ($recordType === 'nameplate') {
           </div>
           <div id="customPreviewContainer"></div>
         </div>
+      <?php elseif ($menu === 'ev_charger_sn'): ?>
+        <?php
+        $indonesianMonths = [
+            1 => 'Januari', 2 => 'Februari', 3 => 'Maret', 4 => 'April',
+            5 => 'Mei', 6 => 'Juni', 7 => 'Juli', 8 => 'Agustus',
+            9 => 'September', 10 => 'Oktober', 11 => 'November', 12 => 'Desember'
+        ];
+        $currentMonthNum = (int) date('n');
+        $currentYear = (int) date('Y');
+        ?>
+        <div class="topbar">
+          <h1>Print SN EV Charge</h1>
+          <p>Halaman untuk konfigurasi, generate, preview, dan cetak stiker Serial Number (SN) EV Charge dengan QR Code (Ukuran: 8cm x 2.8cm, Gap: 0.4cm).</p>
+        </div>
+
+        <div class="card">
+          <div class="step-title">
+            <span class="icon">1</span>
+            Konfigurasi Data Stiker Serial Number
+          </div>
+
+          <div style="display: flex; gap: 10px; margin-bottom: 16px; border-bottom: 1px solid var(--content-line); padding-bottom: 12px;">
+            <button type="button" id="tabBtnRange" class="primary" style="padding: 8px 16px; font-size: 13px;">Generate Range Otomatis</button>
+            <button type="button" id="tabBtnManual" style="padding: 8px 16px; font-size: 13px; background: var(--content-panel-soft); border: 1px solid var(--content-line-strong); color: var(--content-text); cursor: pointer; border-radius: 6px;">Input / Paste Manual</button>
+          </div>
+
+          <!-- Panel 1: Mode Range -->
+          <div id="panelRangeMode">
+            <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 12px; margin-bottom: 14px;">
+              <div>
+                <label style="font-size: 12px; margin-bottom: 4px; display: block;">Prefix Baris 1 (Model)</label>
+                <input type="text" id="snPrefix1" value="M06012EF" placeholder="M06012EF" style="margin-bottom: 0; font-family: monospace; font-weight: bold;">
+              </div>
+              <div>
+                <label style="font-size: 12px; margin-bottom: 4px; display: block;">Prefix Baris 2 (Kode)</label>
+                <input type="text" id="snPrefix2" value="OHDE" placeholder="OHDE" style="margin-bottom: 0; font-family: monospace; font-weight: bold;">
+              </div>
+              <div>
+                <label style="font-size: 12px; margin-bottom: 4px; display: block;">Nomor Awal</label>
+                <input type="number" id="snStartNum" value="5" min="0" placeholder="5" style="margin-bottom: 0;">
+              </div>
+              <div>
+                <label style="font-size: 12px; margin-bottom: 4px; display: block;">Nomor Akhir</label>
+                <input type="number" id="snEndNum" value="10" min="0" placeholder="10" style="margin-bottom: 0;">
+              </div>
+              <div>
+                <label style="font-size: 12px; margin-bottom: 4px; display: block;">Panjang Digit Counter</label>
+                <input type="number" id="snDigits" value="4" min="1" max="10" placeholder="4" style="margin-bottom: 0;">
+              </div>
+            </div>
+            <div style="display: flex; gap: 8px; margin-bottom: 14px; flex-wrap: wrap;">
+              <button type="button" id="btnApplyRange" style="font-size: 12px; padding: 6px 14px; border-radius: 6px; background: var(--content-button); color: #fff; border: none; cursor: pointer;">&#8635; Generate &amp; Terapkan Range</button>
+              <button type="button" id="btnLoadExample" style="font-size: 12px; padding: 6px 14px; border-radius: 6px; background: var(--content-panel-soft); border: 1px solid var(--content-line-strong); cursor: pointer; color: var(--content-text);">Muat Contoh Foto (0005, 0009, 0010)</button>
+            </div>
+          </div>
+
+          <!-- Panel 2: Mode Manual Textarea -->
+          <div id="panelManualMode" style="display: none; margin-bottom: 14px;">
+            <label style="font-size: 12px; margin-bottom: 6px; display: block; font-weight: 500;">Daftar Serial Number (Satu per baris - bisa paste dari Excel):</label>
+            <textarea id="snManualTextarea" rows="6" style="width: 100%; border-radius: 8px; padding: 10px 12px; border: 1px solid var(--content-line-strong); font-family: monospace; font-size: 13px; background: var(--content-panel); color: var(--content-text); resize: vertical;" placeholder="M06012EFOHDE0005&#10;M06012EFOHDE0009&#10;M06012EFOHDE0010">M06012EFOHDE0005&#10;M06012EFOHDE0009&#10;M06012EFOHDE0010</textarea>
+            <div style="font-size: 11px; color: var(--content-muted); margin-top: 4px;">
+              Format otomatis: jika 16 karakter tanpa spasi, otomatis dipecah 8 karakter baris pertama &amp; 8 karakter baris kedua. Bisa juga dipisah spasi (misal: <code>M06012EF OHDE0005</code>).
+            </div>
+          </div>
+
+          <!-- Pengaturan Cetak & Format Label -->
+          <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; padding: 14px; border-radius: 10px; background: var(--content-panel-soft); border: 1px solid var(--content-line-strong); margin-bottom: 16px;">
+            <div>
+              <label style="font-size: 12px; margin-bottom: 4px; display: block;">Bulan Produksi</label>
+              <select id="snMonth" style="margin-bottom: 0;">
+                <?php foreach ($indonesianMonths as $num => $name): ?>
+                  <option value="<?= $name ?>" <?= ($num === $currentMonthNum || $name === 'Agustus') ? ($name === 'Agustus' ? 'selected' : '') : '' ?>><?= $name ?></option>
+                <?php endforeach; ?>
+              </select>
+            </div>
+            <div>
+              <label style="font-size: 12px; margin-bottom: 4px; display: block;">Tahun Produksi</label>
+              <input type="number" id="snYear" value="<?= $currentYear ?>" min="2020" max="2050" style="margin-bottom: 0;">
+            </div>
+            <div>
+              <label style="font-size: 12px; margin-bottom: 4px; display: block;">Jumlah Copy per SN</label>
+              <input type="number" id="snCopies" value="1" min="1" max="50" style="margin-bottom: 0;">
+            </div>
+            <div>
+              <label style="font-size: 12px; margin-bottom: 4px; display: block;">Geser Vertikal (mm)</label>
+              <input type="number" id="snOffsetY" value="5" step="0.5" min="-10" max="20" style="margin-bottom: 0;" title="0.5 cm = 5 mm">
+            </div>
+            <div>
+              <label style="font-size: 12px; margin-bottom: 4px; display: block;">Mode Halaman Printer</label>
+              <select id="snPrinterMode" style="margin-bottom: 0;">
+                <option value="gap_sensor">Thermal Roll (80 x 28 mm, Sensor Gap 4mm)</option>
+                <option value="continuous">Continuous Feed (80 x 32 mm include Gap 4mm)</option>
+              </select>
+            </div>
+          </div>
+
+          <div style="display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 12px;">
+            <button type="button" id="btnPrintSn" class="primary" style="font-size: 15px; padding: 12px 24px; font-weight: 600;">
+              &#128438; Print Stiker SN EV Charge
+            </button>
+            <div id="snSummaryBadge" style="font-size: 13px; font-weight: 600; color: var(--content-text);">
+              Total: <span id="snCountLabel" style="color: #3b82f6;">3</span> Stiker SN (<span id="snSizeLabel">80mm x 28mm, Gap 4mm</span>)
+            </div>
+          </div>
+        </div>
+
+        <!-- Card 2: Live Preview -->
+        <div class="card">
+          <div class="step-title">
+            <span class="icon">2</span>
+            Live Preview Stiker SN EV Charge
+          </div>
+          <p style="margin-top: 0; margin-bottom: 12px; font-size: 13px; color: var(--content-muted);">
+            Tampilan persis sesuai stiker fisik yang akan dicetak (Ukuran stiker: <strong>8cm x 2.8cm</strong>, gap antar stiker: <strong>0.4cm</strong>).
+          </p>
+
+          <div id="snPreviewScrollArea" style="background: #374151; padding: 24px; border-radius: 12px; overflow-x: auto; display: flex; flex-direction: column; align-items: center; gap: 4mm; min-height: 200px; box-shadow: inset 0 2px 8px rgba(0,0,0,0.3);">
+            <!-- Stickers are dynamically injected here -->
+          </div>
+        </div>
       <?php elseif ($menu === 'setting'): ?>
         <?php
         $usersList = $koneksi->query("SELECT * FROM users ORDER BY id ASC");
@@ -4240,7 +5202,7 @@ if ($recordType === 'nameplate') {
                         </div>
                       </td>
                       <td style="text-align: center;">
-                        <span style="display: inline-block; padding: 2px 10px; border-radius: 999px; font-size: 11px; font-weight: bold; text-transform: uppercase; <?= $userItem['role'] === 'admin' ? 'background: rgba(18, 57, 104, 0.18); color: #123968; border: 1px solid rgba(18, 57, 104, 0.35);' : 'background: rgba(100, 116, 139, 0.15); color: #475569; border: 1px solid rgba(100, 116, 139, 0.25);' ?>">
+                        <span class="badge-role <?= ($userItem['role'] ?? 'user') === 'admin' ? 'badge-role-admin' : 'badge-role-user' ?>">
                           <?= htmlspecialchars($userItem['role'] ?? 'user') ?>
                         </span>
                       </td>
@@ -4688,7 +5650,7 @@ if ($recordType === 'nameplate') {
           function applyTheme(theme) {
             var isLight = theme === "light";
             document.body.classList.toggle("light-theme", isLight);
-            btn.textContent = isLight ? "Dark Mode" : "Light Mode";
+            btn.innerHTML = isLight ? "&#127769; Dark Mode" : "&#9728;&#65039; Light Mode";
             btn.setAttribute("aria-pressed", isLight ? "true" : "false");
           }
           var currentTheme = "dark";
@@ -5165,7 +6127,7 @@ if ($recordType === 'nameplate') {
           }
           .sheet .km-group + .km-group {
             margin-left: 4mm;
-            transform: translate(1mm, 0.3mm);
+            transform: translate(3mm, 0.3mm);
           }
           .km-sublabel {
             display: inline-block;
@@ -5263,7 +6225,7 @@ if ($recordType === 'nameplate') {
               transform: translate(1.5mm, 0.3mm) !important;
             }
             .sheet .km-group + .km-group {
-              transform: translate(5mm, 0.3mm) !important;
+              transform: translate(3mm, 0.3mm) !important;
             }
             .km-group {
               height: 13mm;
@@ -6217,6 +7179,330 @@ if ($recordType === 'nameplate') {
       updateCustomPreview();
     }
 
+    function initSidebarDropdowns() {
+      document.querySelectorAll(".nav-dropdown-toggle").forEach(function (btn) {
+        btn.addEventListener("click", function (e) {
+          e.preventDefault();
+          var parent = btn.closest(".nav-dropdown");
+          if (parent) {
+            parent.classList.toggle("open");
+          }
+        });
+      });
+    }
+
+    function initEvSnPrint() {
+      var tabBtnRange = document.getElementById("tabBtnRange");
+      var tabBtnManual = document.getElementById("tabBtnManual");
+      var panelRange = document.getElementById("panelRangeMode");
+      var panelManual = document.getElementById("panelManualMode");
+
+      var snPrefix1 = document.getElementById("snPrefix1");
+      var snPrefix2 = document.getElementById("snPrefix2");
+      var snStartNum = document.getElementById("snStartNum");
+      var snEndNum = document.getElementById("snEndNum");
+      var snDigits = document.getElementById("snDigits");
+      var btnApplyRange = document.getElementById("btnApplyRange");
+      var btnLoadExample = document.getElementById("btnLoadExample");
+
+      var snManualTextarea = document.getElementById("snManualTextarea");
+      var snMonth = document.getElementById("snMonth");
+      var snYear = document.getElementById("snYear");
+      var snCopies = document.getElementById("snCopies");
+      var snOffsetY = document.getElementById("snOffsetY");
+      var snPrinterMode = document.getElementById("snPrinterMode");
+      var btnPrintSn = document.getElementById("btnPrintSn");
+
+      var snPreviewScrollArea = document.getElementById("snPreviewScrollArea");
+      var snCountLabel = document.getElementById("snCountLabel");
+
+      if (!btnPrintSn || !snPreviewScrollArea) {
+        return;
+      }
+
+      var currentMode = "range";
+
+      if (tabBtnRange && tabBtnManual) {
+        tabBtnRange.addEventListener("click", function () {
+          currentMode = "range";
+          tabBtnRange.className = "primary";
+          tabBtnRange.style.background = "";
+          tabBtnRange.style.border = "";
+          tabBtnRange.style.color = "";
+          tabBtnManual.className = "";
+          tabBtnManual.style.background = "var(--content-panel-soft)";
+          tabBtnManual.style.border = "1px solid var(--content-line-strong)";
+          tabBtnManual.style.color = "var(--content-text)";
+          if (panelRange) panelRange.style.display = "block";
+          if (panelManual) panelManual.style.display = "none";
+          updateSnPreview();
+        });
+
+        tabBtnManual.addEventListener("click", function () {
+          currentMode = "manual";
+          tabBtnManual.className = "primary";
+          tabBtnManual.style.background = "";
+          tabBtnManual.style.border = "";
+          tabBtnManual.style.color = "";
+          tabBtnRange.className = "";
+          tabBtnRange.style.background = "var(--content-panel-soft)";
+          tabBtnRange.style.border = "1px solid var(--content-line-strong)";
+          tabBtnRange.style.color = "var(--content-text)";
+          if (panelRange) panelRange.style.display = "none";
+          if (panelManual) panelManual.style.display = "block";
+          updateSnPreview();
+        });
+      }
+
+      function padZero(num, size) {
+        var s = String(num);
+        while (s.length < size) s = "0" + s;
+        return s;
+      }
+
+      function parseSnItem(raw) {
+        var clean = String(raw || "").trim();
+        if (!clean) return null;
+
+        var line1 = "";
+        var line2 = "";
+        var qrPayload = clean.replace(/[\s|]+/g, "");
+
+        if (/[\s|]/.test(clean)) {
+          var parts = clean.split(/[\s|]+/).filter(Boolean);
+          if (parts.length >= 2) {
+            line1 = parts[0];
+            line2 = parts[1];
+          } else {
+            line1 = parts[0];
+            line2 = "";
+          }
+        } else if (clean.length === 16) {
+          line1 = clean.substring(0, 8);
+          line2 = clean.substring(8);
+        } else if (clean.length > 8) {
+          line1 = clean.substring(0, 8);
+          line2 = clean.substring(8);
+        } else {
+          line1 = clean;
+          line2 = "";
+        }
+
+        return {
+          raw: clean,
+          line1: line1,
+          line2: line2,
+          qr: qrPayload
+        };
+      }
+
+      function getSnItems() {
+        var items = [];
+        if (currentMode === "range") {
+          var p1 = (snPrefix1 ? snPrefix1.value.trim() : "") || "M06012EF";
+          var p2 = (snPrefix2 ? snPrefix2.value.trim() : "") || "OHDE";
+          var sNum = parseInt(snStartNum ? snStartNum.value : 0, 10);
+          var eNum = parseInt(snEndNum ? snEndNum.value : 0, 10);
+          var digits = parseInt(snDigits ? snDigits.value : 4, 10) || 4;
+
+          if (isNaN(sNum)) sNum = 0;
+          if (isNaN(eNum)) eNum = 0;
+          if (sNum > eNum) {
+            var temp = sNum; sNum = eNum; eNum = temp;
+          }
+
+          var limit = Math.min(eNum - sNum + 1, 500);
+          for (var i = 0; i < limit; i++) {
+            var counter = sNum + i;
+            var counterStr = padZero(counter, digits);
+            var fullRaw = p1 + p2 + counterStr;
+            items.push({
+              raw: fullRaw,
+              line1: p1,
+              line2: p2 + counterStr,
+              qr: fullRaw
+            });
+          }
+        } else {
+          var text = snManualTextarea ? snManualTextarea.value : "";
+          var lines = text.split("\n");
+          for (var j = 0; j < lines.length; j++) {
+            var parsed = parseSnItem(lines[j]);
+            if (parsed) {
+              items.push(parsed);
+            }
+          }
+        }
+        return items;
+      }
+
+      function updateSnPreview() {
+        var items = getSnItems();
+        var copies = parseInt(snCopies ? snCopies.value : 1, 10) || 1;
+        var month = snMonth ? snMonth.value : "Agustus";
+        var year = snYear ? snYear.value : "2026";
+        var prodText = "Produksi : " + month + " - " + year;
+        var offsetY = parseFloat(snOffsetY ? snOffsetY.value : 5);
+        if (isNaN(offsetY)) offsetY = 5;
+
+        if (snCountLabel) {
+          snCountLabel.textContent = items.length * copies;
+        }
+
+        if (items.length === 0) {
+          snPreviewScrollArea.innerHTML = '<div style="color: #9ca3af; font-size: 14px; padding: 30px; text-align: center;">Tidak ada data Serial Number untuk ditampilkan.</div>';
+          return;
+        }
+
+        var html = '';
+        var previewLimit = Math.min(items.length, 50);
+        for (var idx = 0; idx < previewLimit; idx++) {
+          var item = items[idx];
+          for (var c = 0; c < Math.min(copies, 2); c++) {
+            html += '<div class="ev-sn-preview-item" style="width: 80mm; height: 28mm; background: #ffffff; border-radius: 3.5mm; padding: 0 3.2mm; display: flex; flex-direction: row; align-items: flex-start; box-sizing: border-box; overflow: hidden; position: relative; box-shadow: 0 4px 10px rgba(0,0,0,0.3); flex-shrink: 0;">';
+            html += '  <div class="ev-sn-content-row" style="display: flex; flex-direction: row; align-items: center; width: 100%; height: 21mm; margin-top: ' + offsetY + 'mm;">';
+            html += '    <div class="ev-sn-qr-box" style="width: 20mm; height: 20mm; flex-shrink: 0; display: flex; align-items: center; justify-content: center;">';
+            html += '      <svg class="np-qr" data-qr="' + escapeHtml(item.qr) + '" style="width:100%; height:100%; display:block;"></svg>';
+            html += '    </div>';
+            html += '    <div style="flex: 1; height: 100%; display: flex; flex-direction: column; justify-content: space-between; padding-left: 3.5mm; overflow: hidden; box-sizing: border-box;">';
+            html += '      <div style="font-family: Arial, sans-serif; font-size: 8pt; font-weight: 700; color: #111; line-height: 1; margin: 0;">Nomor Serial:</div>';
+            html += '      <div style="display: flex; flex-direction: column; justify-content: center; line-height: 0.92; margin: 0.4mm 0;">';
+            html += '        <div style="font-family: Arial, \'Arial Black\', sans-serif; font-size: 18pt; font-weight: 900; color: #000; letter-spacing: 0.025em; white-space: nowrap;">' + escapeHtml(item.line1) + '</div>';
+            html += '        <div style="font-family: Arial, \'Arial Black\', sans-serif; font-size: 18pt; font-weight: 900; color: #000; letter-spacing: 0.025em; white-space: nowrap;">' + escapeHtml(item.line2) + '</div>';
+            html += '      </div>';
+            html += '      <div style="font-family: Arial, sans-serif; font-size: 8.5pt; font-weight: 700; color: #111; line-height: 1; margin: 0;">' + escapeHtml(prodText) + '</div>';
+            html += '    </div>';
+            html += '  </div>';
+            html += '</div>';
+          }
+        }
+        if (items.length > previewLimit) {
+          html += '<div style="color: #cbd5e1; font-size: 12px; margin-top: 8px;">(Menampilkan preview ' + previewLimit + ' dari ' + items.length + ' nomor serial)</div>';
+        }
+
+        snPreviewScrollArea.innerHTML = html;
+
+        if (window.QRCodeRuntime && typeof window.QRCodeRuntime.renderAll === "function") {
+          window.QRCodeRuntime.renderAll(snPreviewScrollArea, ".np-qr[data-qr]");
+        }
+      }
+
+      if (btnApplyRange) {
+        btnApplyRange.addEventListener("click", updateSnPreview);
+      }
+      if (btnLoadExample) {
+        btnLoadExample.addEventListener("click", function () {
+          currentMode = "manual";
+          if (tabBtnManual) tabBtnManual.click();
+          if (snManualTextarea) {
+            snManualTextarea.value = "M06012EFOHDE0005\nM06012EFOHDE0009\nM06012EFOHDE0010";
+          }
+          if (snMonth) snMonth.value = "Agustus";
+          if (snYear) snYear.value = "2026";
+          if (snOffsetY) snOffsetY.value = "5";
+          updateSnPreview();
+        });
+      }
+
+      [snPrefix1, snPrefix2, snStartNum, snEndNum, snDigits, snMonth, snYear, snCopies, snOffsetY].forEach(function (el) {
+        if (el) el.addEventListener("input", updateSnPreview);
+      });
+      if (snManualTextarea) {
+        snManualTextarea.addEventListener("input", updateSnPreview);
+      }
+
+      function printSnLabels() {
+        var items = getSnItems();
+        if (items.length === 0) {
+          alert("Tidak ada nomor serial untuk dicetak.");
+          return;
+        }
+
+        var copies = parseInt(snCopies ? snCopies.value : 1, 10) || 1;
+        var month = snMonth ? snMonth.value : "Agustus";
+        var year = snYear ? snYear.value : "2026";
+        var prodText = "Produksi : " + month + " - " + year;
+        var mode = snPrinterMode ? snPrinterMode.value : "gap_sensor";
+        var offsetY = parseFloat(snOffsetY ? snOffsetY.value : 5);
+        if (isNaN(offsetY)) offsetY = 5;
+
+        var pageHeight = (mode === "continuous") ? "32mm" : "28mm";
+        var totalPrinted = items.length * copies;
+
+        // AJAX log save
+        try {
+          var fd = new FormData();
+          fd.append("action", "save_ev_sn_log");
+          fd.append("total_printed", totalPrinted);
+          fd.append("start_sn", items[0].raw);
+          fd.append("end_sn", items[items.length - 1].raw);
+          fd.append("prod_date", prodText);
+          fetch(window.location.href, { method: "POST", body: fd });
+        } catch (e) {}
+
+        var w = window.open("", "_blank");
+        if (!w) {
+          alert("Pop-up window diblokir oleh browser. Harap izinkan pop-up untuk mencetak.");
+          return;
+        }
+
+        w.document.write('<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Print SN EV Charge</title>');
+        w.document.write('<style>');
+        w.document.write('@page { size: 80mm ' + pageHeight + '; margin: 0; }');
+        w.document.write('* { box-sizing: border-box; -webkit-print-color-adjust: exact; print-color-adjust: exact; }');
+        w.document.write('html, body { margin: 0; padding: 0; background: #fff; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif; }');
+        w.document.write('@media screen { body { background: #55657c; padding: 20px; display: flex; flex-direction: column; align-items: center; gap: 4mm; } .ev-sn-sticker { box-shadow: 0 4px 12px rgba(0,0,0,0.3); } .screen-btn-bar { position: fixed; top: 12px; right: 12px; z-index: 999; } .screen-btn { background: #2563eb; color: #fff; border: none; padding: 10px 20px; font-size: 14px; font-weight: bold; border-radius: 6px; cursor: pointer; box-shadow: 0 4px 10px rgba(0,0,0,0.25); } }');
+        w.document.write('@media print { body { background: #fff !important; width: 80mm; } .ev-sn-sticker { page-break-after: always; break-after: page; box-shadow: none !important; border: none !important; } .screen-btn-bar { display: none !important; } }');
+        w.document.write('.ev-sn-sticker { width: 80mm; height: 28mm; background: #ffffff; padding: 0 3.2mm; display: flex; flex-direction: row; align-items: flex-start; overflow: hidden; box-sizing: border-box; }');
+        w.document.write('.ev-sn-content-row { display: flex; flex-direction: row; align-items: center; width: 100%; height: 21mm; margin-top: ' + offsetY + 'mm; }');
+        w.document.write('.ev-sn-qr { width: 20mm; height: 20mm; flex-shrink: 0; display: flex; align-items: center; justify-content: center; }');
+        w.document.write('.ev-sn-qr svg { width: 100%; height: 100%; display: block; }');
+        w.document.write('.ev-sn-info { flex: 1; height: 100%; display: flex; flex-direction: column; justify-content: space-between; padding-left: 3.5mm; overflow: hidden; box-sizing: border-box; }');
+        w.document.write('.ev-sn-title { font-size: 8pt; font-weight: 700; color: #111; line-height: 1; margin: 0; }');
+        w.document.write('.ev-sn-code-box { display: flex; flex-direction: column; justify-content: center; line-height: 0.92; margin: 0.4mm 0; }');
+        w.document.write('.ev-sn-code-line { font-family: Arial, "Arial Black", sans-serif; font-size: 18pt; font-weight: 900; color: #000; letter-spacing: 0.025em; white-space: nowrap; }');
+        w.document.write('.ev-sn-date { font-size: 8.5pt; font-weight: 700; color: #111; line-height: 1; margin: 0; }');
+        w.document.write('</style></head><body>');
+        w.document.write('<div class="screen-btn-bar"><button class="screen-btn" onclick="window.print()">&#128438; Cetak Sekarang (Print)</button></div>');
+
+        for (var i = 0; i < items.length; i++) {
+          var it = items[i];
+          for (var c = 0; c < copies; c++) {
+            w.document.write('<div class="ev-sn-sticker">');
+            w.document.write('  <div class="ev-sn-content-row">');
+            w.document.write('    <div class="ev-sn-qr">');
+            w.document.write('      <svg class="np-qr" data-qr="' + escapeHtml(it.qr) + '"></svg>');
+            w.document.write('    </div>');
+            w.document.write('    <div class="ev-sn-info">');
+            w.document.write('      <div class="ev-sn-title">Nomor Serial:</div>');
+            w.document.write('      <div class="ev-sn-code-box">');
+            w.document.write('        <div class="ev-sn-code-line">' + escapeHtml(it.line1) + '</div>');
+            w.document.write('        <div class="ev-sn-code-line">' + escapeHtml(it.line2) + '</div>');
+            w.document.write('      </div>');
+            w.document.write('      <div class="ev-sn-date">' + escapeHtml(prodText) + '</div>');
+            w.document.write('    </div>');
+            w.document.write('  </div>');
+            w.document.write('</div>');
+          }
+        }
+
+        w.document.write('<script src="JS2/qrcode-generator.min.js"><\/script>');
+        w.document.write('<script src="JS2/qrcode-offline.js"><\/script>');
+        w.document.write('<script>');
+        w.document.write('if (window.opener && window.opener.QRCodeRuntime) { window.opener.QRCodeRuntime.renderAll(document, ".np-qr[data-qr]"); }');
+        w.document.write('setTimeout(function() { window.print(); }, 250);');
+        w.document.write('<\/script>');
+        w.document.write('</body></html>');
+        w.document.close();
+      }
+
+      if (btnPrintSn) {
+        btnPrintSn.addEventListener("click", printSnLabels);
+      }
+
+      updateSnPreview();
+    }
+
     function initCustomPrint() {
       var printBtn = document.getElementById("customPrintBtn");
       if (printBtn) {
@@ -6247,10 +7533,15 @@ if ($recordType === 'nameplate') {
       
       updateCopyCountConstraint();
     }
-    if (document.readyState === "loading") {
-      document.addEventListener("DOMContentLoaded", initCustomPrint);
-    } else {
+    function initAllModules() {
+      initSidebarDropdowns();
+      initEvSnPrint();
       initCustomPrint();
+    }
+    if (document.readyState === "loading") {
+      document.addEventListener("DOMContentLoaded", initAllModules);
+    } else {
+      initAllModules();
     }
   </script>
 </body>

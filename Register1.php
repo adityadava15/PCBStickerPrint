@@ -39,6 +39,10 @@ if (isset($_POST['register'])) {
 <head>
   <meta charset="UTF-8">
   <title>Register - PCB Barcode Print</title>
+  <link rel="icon" type="image/png" sizes="32x32" href="IMG/favicon-32x32.png">
+  <link rel="icon" type="image/png" sizes="16x16" href="IMG/favicon-16x16.png">
+  <link rel="shortcut icon" href="IMG/favicon.ico">
+  <link rel="apple-touch-icon" sizes="180x180" href="IMG/apple-touch-icon.png">
   <style>
     body {
       font-family: Arial, sans-serif;
