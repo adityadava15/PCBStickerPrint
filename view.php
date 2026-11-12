@@ -1,5 +1,7 @@
 <?php
-session_start();
+if (session_status() === PHP_SESSION_NONE) {
+    session_start();
+}
 if (!isset($_SESSION['username']) || $_SESSION['role'] !== 'admin') {
     header("Location: Login1.php");
     exit;
@@ -44,7 +46,7 @@ if (isset($_GET['action']) && $_GET['action'] === 'download_wo_txt') {
         $safeWo = $koneksi->real_escape_string($downloadWo);
         $res = $koneksi->query("SELECT nomor FROM {$pcbNumberTable} WHERE wo='$safeWo' ORDER BY id ASC");
         if ($res && $res->num_rows > 0) {
-            $filename = preg_replace('/[^a-zA-Z0-9_\-]/', '_', $downloadWo) . '.txt';
+            $filename = preg_replace('/[\\/:*?"<>|]/', '_', $downloadWo) . '.txt';
             header('Content-Type: text/plain; charset=utf-8');
             header('Content-Disposition: attachment; filename="' . $filename . '"');
             while ($row = $res->fetch_assoc()) {
@@ -76,7 +78,8 @@ $koneksi->query(
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         INDEX idx_wo (wo),
         INDEX idx_batch_id (batch_id),
-        INDEX idx_batch_printed (batch_id, is_printed)
+        INDEX idx_batch_printed (batch_id, is_printed),
+        UNIQUE KEY uniq_batch_nomor (batch_id, nomor)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
 );
 $koneksi->query(
@@ -186,7 +189,20 @@ if ($evUniqIdxRes && $evUniqIdxRes->num_rows > 0) {
 
 function loadEvChargerTypeOptions(mysqli $koneksi, $filePath)
 {
+    $defaultOptions = [
+        "2150156800-Electronic lock board",
+        "2150172180-LED board S (Head)",
+        "2150172190-LED board L (Head)",
+        "2150174700-EMC Filter(DC)",
+        "2150176020-EMC Filter(AC)",
+        "2150511950-LED board(Nozzle)",
+        "2150513770-PLC board",
+        "2150514390-CCU"
+    ];
     $optionsMap = [];
+    foreach ($defaultOptions as $defaultOpt) {
+        $optionsMap[$defaultOpt] = true;
+    }
 
     if (is_file($filePath)) {
         $fileJson = file_get_contents($filePath);
@@ -247,6 +263,9 @@ function loadTypeMeterOptions(mysqli $koneksi, $filePath)
     ];
 
     $optionsMap = [];
+    foreach ($defaultOptions as $defaultOpt) {
+        $optionsMap[$defaultOpt] = true;
+    }
 
     if (is_file($filePath)) {
         $fileJson = file_get_contents($filePath);
@@ -841,14 +860,17 @@ $msgUpload = '';
 $lastWoInput = '';
 $lastStartInput = '';
 $lastEndInput = '';
+$lastBatchInput = 1;
 
 if (isset($_POST['upload_range'])) {
     $rawWo = trim((string) ($_POST['wo'] ?? ''));
     $startNumber = trim((string) ($_POST['start_number'] ?? ''));
     $endNumber = trim((string) ($_POST['end_number'] ?? ''));
+    $rawBatchNum = isset($_POST['batch_num']) ? (int) $_POST['batch_num'] : 1;
     $lastWoInput = $rawWo;
     $lastStartInput = $startNumber;
     $lastEndInput = $endNumber;
+    $lastBatchInput = $rawBatchNum;
 
     if ($rawWo === '' || $startNumber === '' || $endNumber === '') {
         $msgUpload = "WO Number, Nomor Awal, dan Nomor Akhir wajib diisi.";
@@ -856,6 +878,8 @@ if (isset($_POST['upload_range'])) {
         $rangeInfo = parseBarcodeRange($startNumber, $endNumber);
         if (!$rangeInfo['success']) {
             $msgUpload = $rangeInfo['error'];
+        } elseif ($isEvChargerMenu && bccomp($rangeInfo['count'], '500') > 0) {
+            $msgUpload = "Untuk EV Charger, jumlah nomor range tidak boleh lebih dari 500 nomor per jenis PCB / batch (Maksimal 500 nomor). Anda memasukkan " . number_format((float) $rangeInfo['count'], 0, ',', '.') . " nomor.";
         } else {
             $prefix = $rangeInfo['prefix'];
             $curr = $rangeInfo['start_num'];
@@ -867,66 +891,146 @@ if (isset($_POST['upload_range'])) {
             $batchValues = [];
             $inserted = 0;
 
-            // Generate and insert in batches of 1000
-            while (bccomp($curr, $end) <= 0) {
-                $numStr = $prefix . str_pad($curr, $padLen, '0', STR_PAD_LEFT);
-                $safeNum = $koneksi->real_escape_string($numStr);
-                $batchValues[] = "('$safeNum', '$safeWo')";
-                $inserted++;
+            // Untuk EV Charger, langsung buat/hubungkan batch sesuai batch_num yang dipilih
+            $targetBatchId = null;
+            $batchNum = $rawBatchNum > 0 ? $rawBatchNum : 1;
+            if ($isEvChargerMenu) {
+                $nama_batch = "Batch $batchNum - $safeWo";
+                $checkBatchRes = $koneksi->query("SELECT id FROM {$pcbBatchTable} WHERE nama_batch='$nama_batch' AND wo='$safeWo' LIMIT 1");
+                if ($checkBatchRes && $checkBatchRes->num_rows > 0) {
+                    $existingBatchRow = $checkBatchRes->fetch_assoc();
+                    $targetBatchId = (int) $existingBatchRow['id'];
+                    // Cek apakah batch ini sudah memiliki nomor barcode sebelumnya
+                    $cntCheck = $koneksi->query("SELECT COUNT(*) AS cnt FROM {$pcbNumberTable} WHERE batch_id=$targetBatchId");
+                    $cntRow = $cntCheck ? $cntCheck->fetch_assoc() : null;
+                    if ($cntRow && (int)$cntRow['cnt'] > 0) {
+                        $jumpUrl = "view.php?menu=" . urlencode($menu) . "&wo=" . urlencode($rawWo) . "&batch_id=" . $targetBatchId;
+                        $msgUpload = "Gagal upload: <strong>" . htmlspecialchars($nama_batch) . "</strong> sudah memiliki <strong>" . number_format($cntRow['cnt']) . " nomor barcode</strong> di database! Silakan pilih nomor Batch berikutnya (misal Batch " . ($batchNum + 1) . ") atau bersihkan data batch sebelumnya di Langkah 2. <a href=\"" . htmlspecialchars($jumpUrl) . "\" class=\"btn-download-link\" style=\"display: inline-block; margin-left: 10px; padding: 4px 14px; background: #10b981; color: #fff; border-radius: 999px; text-decoration: none; font-size: 12px; font-weight: bold;\">&#128424; Buka Batch Ini</a>";
+                    }
+                } else {
+                    $koneksi->query("INSERT INTO {$pcbBatchTable} (nama_batch, wo) VALUES ('$nama_batch', '$safeWo')");
+                    $targetBatchId = (int) $koneksi->insert_id;
+                }
+            }
 
-                if (count($batchValues) >= 1000) {
-                    $sql = "INSERT INTO {$pcbNumberTable} (nomor, wo) VALUES " . implode(',', $batchValues);
-                    $koneksi->query($sql);
-                    $batchValues = [];
+            if (empty($msgUpload)) {
+                // Generate and insert in batches of 1000
+                while (bccomp($curr, $end) <= 0) {
+                    $numStr = $prefix . str_pad($curr, $padLen, '0', STR_PAD_LEFT);
+                    $safeNum = $koneksi->real_escape_string($numStr);
+                    if ($targetBatchId !== null) {
+                        $batchValues[] = "('$safeNum', '$safeWo', $targetBatchId)";
+                    } else {
+                        $batchValues[] = "('$safeNum', '$safeWo')";
+                    }
+                    $inserted++;
+
+                    if (count($batchValues) >= 1000) {
+                        if ($targetBatchId !== null) {
+                            $sql = "INSERT IGNORE INTO {$pcbNumberTable} (nomor, wo, batch_id) VALUES " . implode(',', $batchValues);
+                        } else {
+                            $sql = "INSERT INTO {$pcbNumberTable} (nomor, wo) VALUES " . implode(',', $batchValues);
+                        }
+                        $koneksi->query($sql);
+                        $batchValues = [];
+                    }
+
+                    $curr = bcadd($curr, '1');
                 }
 
-                $curr = bcadd($curr, '1');
-            }
+                if (!empty($batchValues)) {
+                    if ($targetBatchId !== null) {
+                        $sql = "INSERT IGNORE INTO {$pcbNumberTable} (nomor, wo, batch_id) VALUES " . implode(',', $batchValues);
+                    } else {
+                        $sql = "INSERT INTO {$pcbNumberTable} (nomor, wo) VALUES " . implode(',', $batchValues);
+                    }
+                    $koneksi->query($sql);
+                }
 
-            if (!empty($batchValues)) {
-                $sql = "INSERT INTO {$pcbNumberTable} (nomor, wo) VALUES " . implode(',', $batchValues);
-                $koneksi->query($sql);
+                $downloadUrl = "view.php?menu=" . urlencode($menu) . "&action=download_wo_txt&wo=" . urlencode($rawWo);
+                if ($isEvChargerMenu && $targetBatchId !== null) {
+                    $jumpUrl = "view.php?menu=" . urlencode($menu) . "&wo=" . urlencode($rawWo) . "&batch_id=" . $targetBatchId;
+                    $msgUpload = "Upload range nomor berhasil untuk WO: <strong>" . htmlspecialchars($rawWo) . "</strong> (<strong>Batch {$batchNum}</strong>, " . number_format((float) $totalCount, 0, ',', '.') . " nomor dimasukkan ke database). <a href=\"" . htmlspecialchars($jumpUrl) . "\" class=\"btn-download-link\" style=\"display: inline-block; margin-left: 10px; padding: 4px 14px; background: #10b981; color: #fff; border-radius: 999px; text-decoration: none; font-size: 12px; font-weight: bold;\">&#128424; Cetak Batch {$batchNum}</a> <a href=\"" . htmlspecialchars($downloadUrl) . "\" class=\"btn-download-link\" style=\"display: inline-block; margin-left: 8px; padding: 4px 12px; background: #123968; color: #fff; border-radius: 999px; text-decoration: none; font-size: 12px; font-weight: bold;\">&#128190; Download TXT</a>";
+                } else {
+                    $msgUpload = "Upload range nomor berhasil untuk WO: <strong>" . htmlspecialchars($rawWo) . "</strong> (" . number_format((float) $totalCount, 0, ',', '.') . " nomor dimasukkan ke database). <a href=\"" . htmlspecialchars($downloadUrl) . "\" class=\"btn-download-link\" style=\"display: inline-block; margin-left: 10px; padding: 4px 12px; background: #123968; color: #fff; border-radius: 999px; text-decoration: none; font-size: 12px; font-weight: bold;\">&#128190; Download TXT</a>";
+                }
             }
-
-            $downloadUrl = "view.php?menu=" . urlencode($menu) . "&action=download_wo_txt&wo=" . urlencode($rawWo);
-            $msgUpload = "Upload range nomor berhasil untuk WO: <strong>" . htmlspecialchars($rawWo) . "</strong> (" . number_format((float) $totalCount, 0, ',', '.') . " nomor dimasukkan ke database). <a href=\"" . htmlspecialchars($downloadUrl) . "\" class=\"btn-download-link\" style=\"display: inline-block; margin-left: 10px; padding: 4px 12px; background: #123968; color: #fff; border-radius: 999px; text-decoration: none; font-size: 12px; font-weight: bold;\">&#128190; Download TXT</a>";
         }
     }
 } elseif (isset($_POST['upload'])) {
     $wo = $koneksi->real_escape_string(trim($_POST['wo']));
-    $file = $_FILES['file']['tmp_name'] ?? null;
-    if ($file && is_uploaded_file($file)) {
-        $handle = fopen($file, "r");
-        if ($handle) {
-            $batchValues = [];
-            $fileCount = 0;
-            while (($data = fgetcsv($handle, 0, ",")) !== false) {
-                if (!isset($data[0])) {
-                    continue;
-                }
-                $nomor = trim($data[0]);
-                if ($nomor === '') {
-                    continue;
-                }
-                $safeNomor = $koneksi->real_escape_string($nomor);
-                $batchValues[] = "('$safeNomor', '$wo')";
-                $fileCount++;
-                if (count($batchValues) >= 1000) {
-                    $koneksi->query("INSERT INTO {$pcbNumberTable} (nomor, wo) VALUES " . implode(',', $batchValues));
-                    $batchValues = [];
-                }
+    $rawBatchNum = isset($_POST['batch_num']) ? (int) $_POST['batch_num'] : 1;
+    $targetBatchId = null;
+    $batchNum = $rawBatchNum > 0 ? $rawBatchNum : 1;
+    if ($isEvChargerMenu) {
+        $nama_batch = "Batch $batchNum - $wo";
+        $checkBatchRes = $koneksi->query("SELECT id FROM {$pcbBatchTable} WHERE nama_batch='$nama_batch' AND wo='$wo' LIMIT 1");
+        if ($checkBatchRes && $checkBatchRes->num_rows > 0) {
+            $existingBatchRow = $checkBatchRes->fetch_assoc();
+            $targetBatchId = (int) $existingBatchRow['id'];
+            $cntCheck = $koneksi->query("SELECT COUNT(*) AS cnt FROM {$pcbNumberTable} WHERE batch_id=$targetBatchId");
+            $cntRow = $cntCheck ? $cntCheck->fetch_assoc() : null;
+            if ($cntRow && (int)$cntRow['cnt'] > 0) {
+                $jumpUrl = "view.php?menu=" . urlencode($menu) . "&wo=" . urlencode($wo) . "&batch_id=" . $targetBatchId;
+                $msgUpload = "Gagal upload: <strong>" . htmlspecialchars($nama_batch) . "</strong> sudah memiliki <strong>" . number_format($cntRow['cnt']) . " nomor barcode</strong> di database! Pilih nomor Batch berikutnya atau bersihkan data batch di Langkah 2. <a href=\"" . htmlspecialchars($jumpUrl) . "\" class=\"btn-download-link\" style=\"display: inline-block; margin-left: 10px; padding: 4px 14px; background: #10b981; color: #fff; border-radius: 999px; text-decoration: none; font-size: 12px; font-weight: bold;\">&#128424; Buka Batch Ini</a>";
             }
-            if (!empty($batchValues)) {
-                $koneksi->query("INSERT INTO {$pcbNumberTable} (nomor, wo) VALUES " . implode(',', $batchValues));
-            }
+        } else {
+            $koneksi->query("INSERT INTO {$pcbBatchTable} (nama_batch, wo) VALUES ('$nama_batch', '$wo')");
+            $targetBatchId = (int) $koneksi->insert_id;
+        }
+    }
+    if (empty($msgUpload)) {
+        $file = $_FILES['file']['tmp_name'] ?? null;
+        if ($file && is_uploaded_file($file)) {
+            $handle = fopen($file, "r");
+            if ($handle) {
+                $batchValues = [];
+                $fileCount = 0;
+                while (($data = fgetcsv($handle, 0, ",")) !== false) {
+                    if (!isset($data[0])) {
+                        continue;
+                    }
+                    $nomor = trim($data[0]);
+                    if ($nomor === '') {
+                        continue;
+                    }
+                    $safeNomor = $koneksi->real_escape_string($nomor);
+                    if ($targetBatchId !== null) {
+                        $batchValues[] = "('$safeNomor', '$wo', $targetBatchId)";
+                    } else {
+                        $batchValues[] = "('$safeNomor', '$wo')";
+                    }
+                    $fileCount++;
+                    if (count($batchValues) >= 1000) {
+                        if ($targetBatchId !== null) {
+                            $koneksi->query("INSERT IGNORE INTO {$pcbNumberTable} (nomor, wo, batch_id) VALUES " . implode(',', $batchValues));
+                        } else {
+                            $koneksi->query("INSERT INTO {$pcbNumberTable} (nomor, wo) VALUES " . implode(',', $batchValues));
+                        }
+                        $batchValues = [];
+                    }
+                }
+                if (!empty($batchValues)) {
+                    if ($targetBatchId !== null) {
+                        $koneksi->query("INSERT IGNORE INTO {$pcbNumberTable} (nomor, wo, batch_id) VALUES " . implode(',', $batchValues));
+                    } else {
+                        $koneksi->query("INSERT INTO {$pcbNumberTable} (nomor, wo) VALUES " . implode(',', $batchValues));
+                    }
+                }
             fclose($handle);
             $downloadUrl = "view.php?menu=" . urlencode($menu) . "&action=download_wo_txt&wo=" . urlencode(trim($_POST['wo']));
-            $msgUpload = "Upload file berhasil untuk WO: <strong>" . htmlspecialchars(trim($_POST['wo'])) . "</strong> (" . number_format($fileCount, 0, ',', '.') . " nomor). <a href=\"" . htmlspecialchars($downloadUrl) . "\" class=\"btn-download-link\" style=\"display: inline-block; margin-left: 10px; padding: 4px 12px; background: #123968; color: #fff; border-radius: 999px; text-decoration: none; font-size: 12px; font-weight: bold;\">&#128190; Download TXT</a>";
+            if ($isEvChargerMenu && $targetBatchId !== null) {
+                $jumpUrl = "view.php?menu=" . urlencode($menu) . "&wo=" . urlencode(trim($_POST['wo'])) . "&batch_id=" . $targetBatchId;
+                $msgUpload = "Upload file berhasil untuk WO: <strong>" . htmlspecialchars(trim($_POST['wo'])) . "</strong> (<strong>Batch {$batchNum}</strong>, " . number_format($fileCount, 0, ',', '.') . " nomor). <a href=\"" . htmlspecialchars($jumpUrl) . "\" class=\"btn-download-link\" style=\"display: inline-block; margin-left: 10px; padding: 4px 14px; background: #10b981; color: #fff; border-radius: 999px; text-decoration: none; font-size: 12px; font-weight: bold;\">&#128424; Cetak Batch {$batchNum}</a> <a href=\"" . htmlspecialchars($downloadUrl) . "\" class=\"btn-download-link\" style=\"display: inline-block; margin-left: 8px; padding: 4px 12px; background: #123968; color: #fff; border-radius: 999px; text-decoration: none; font-size: 12px; font-weight: bold;\">&#128190; Download TXT</a>";
+            } else {
+                $msgUpload = "Upload file berhasil untuk WO: <strong>" . htmlspecialchars(trim($_POST['wo'])) . "</strong> (" . number_format($fileCount, 0, ',', '.') . " nomor). <a href=\"" . htmlspecialchars($downloadUrl) . "\" class=\"btn-download-link\" style=\"display: inline-block; margin-left: 10px; padding: 4px 12px; background: #123968; color: #fff; border-radius: 999px; text-decoration: none; font-size: 12px; font-weight: bold;\">&#128190; Download TXT</a>";
+            }
         } else {
             $msgUpload = "Gagal membuka file upload.";
         }
     } else {
         $msgUpload = "File tidak terdeteksi.";
+    }
     }
 }
 
@@ -2073,13 +2177,31 @@ if ($recordType === 'nameplate') {
     }
 
     .sidebar {
+      position: sticky;
+      top: 0;
+      height: 100vh;
+      overflow-y: auto;
+      overflow-x: hidden;
       background: var(--sidebar);
       border-right: 1px solid var(--line);
       padding: 24px 16px;
       display: flex;
       flex-direction: column;
       gap: 18px;
-      overflow: hidden;
+      z-index: 100;
+      scrollbar-width: thin;
+      scrollbar-color: var(--line-strong) transparent;
+    }
+
+    .sidebar::-webkit-scrollbar {
+      width: 6px;
+    }
+    .sidebar::-webkit-scrollbar-thumb {
+      background: var(--line-strong);
+      border-radius: 4px;
+    }
+    .sidebar::-webkit-scrollbar-track {
+      background: transparent;
     }
 
     .sidebar-header {
@@ -3541,6 +3663,9 @@ if ($recordType === 'nameplate') {
       }
 
       .sidebar {
+        position: static;
+        height: auto;
+        overflow-y: visible;
         border-right: none;
         border-bottom: 1px solid var(--line);
       }
@@ -3658,8 +3783,8 @@ if ($recordType === 'nameplate') {
       <button type="button" id="themeToggleBtn" class="theme-toggle" aria-label="Toggle Theme">&#9728;&#65039; Light Mode</button>
 	      <?php if ($menu === 'pcb' || $menu === 'ev_charger'): ?>
 	        <div class="topbar">
-	          <h1><?= $isEvChargerMenu ? 'Print PCB EV Chager' : 'Print PCB Barcode' ?></h1>
-	          <p><?= $isEvChargerMenu ? 'Halaman admin untuk upload, split, preview, dan print barcode PCB EV Chager.' : 'Halaman utama setelah login untuk upload, split, preview, dan print barcode PCB.' ?></p>
+	          <h1><?= $isEvChargerMenu ? 'Print PCB EV Charger' : 'Print PCB Barcode' ?></h1>
+	          <p><?= $isEvChargerMenu ? 'Halaman admin untuk input range, preview, dan print barcode PCB EV Charger.' : 'Halaman utama setelah login untuk upload, split, preview, dan print barcode PCB.' ?></p>
 	        </div>
 
         <div class="card">
@@ -3674,10 +3799,37 @@ if ($recordType === 'nameplate') {
             <form method="POST" id="rangeForm">
               <input type="hidden" name="menu" value="<?= htmlspecialchars($menu) ?>">
               
-              <label for="rangeWo">WO Number</label>
-              <input type="text" id="rangeWo" name="wo" placeholder="Enter work order number" required value="<?= htmlspecialchars($lastWoInput ?? '') ?>">
+              <?php if ($isEvChargerMenu): ?>
+                <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; margin-bottom: 12px;">
+                  <div>
+                    <label for="rangeWo">WO Number (Jenis PCB EV)</label>
+                    <select id="rangeWo" name="wo" required style="width: 100%; margin-bottom: 0;">
+                      <option value="">-- Pilih WO Number EV Charge --</option>
+                      <?php foreach ($evTypeOptions as $evOpt): ?>
+                        <option value="<?= htmlspecialchars($evOpt) ?>" <?= ($lastWoInput ?? '') === $evOpt ? 'selected' : '' ?>>
+                          <?= htmlspecialchars($evOpt) ?>
+                        </option>
+                      <?php endforeach; ?>
+                    </select>
+                  </div>
+                  <div>
+                    <label for="rangeBatch">Batch</label>
+                    <select id="rangeBatch" name="batch_num" required style="width: 100%; margin-bottom: 0;">
+                      <option value="">-- Pilih Batch --</option>
+                      <?php for ($b = 1; $b <= 50; $b++): ?>
+                        <option value="<?= $b ?>" <?= ((int)($lastBatchInput ?? 1) === $b) ? 'selected' : '' ?>>
+                          Batch <?= $b ?>
+                        </option>
+                      <?php endfor; ?>
+                    </select>
+                  </div>
+                </div>
+              <?php else: ?>
+                <label for="rangeWo">WO Number</label>
+                <input type="text" id="rangeWo" name="wo" placeholder="Enter work order number" required value="<?= htmlspecialchars($lastWoInput ?? '') ?>">
+              <?php endif; ?>
 
-              <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; margin-bottom: 12px;">
+              <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; margin-bottom: 8px;">
                 <div>
                   <label for="rangeStartNumber">Nomor Awal (Start Number)</label>
                   <input type="text" id="rangeStartNumber" name="start_number" placeholder="Contoh: 6003156549 atau HXE0001" required value="<?= htmlspecialchars($lastStartInput ?? '') ?>" style="margin-bottom: 0;">
@@ -3687,6 +3839,11 @@ if ($recordType === 'nameplate') {
                   <input type="text" id="rangeEndNumber" name="end_number" placeholder="Contoh: 6003157548 atau HXE1000" required value="<?= htmlspecialchars($lastEndInput ?? '') ?>" style="margin-bottom: 0;">
                 </div>
               </div>
+              <?php if ($isEvChargerMenu): ?>
+                <div style="font-size: 12px; color: var(--content-muted); margin-bottom: 12px;">
+                  * Khusus PCB EV Charger: Range nomor yang dimasukkan maksimal <strong>500 nomor</strong> per batch/jenis PCB.
+                </div>
+              <?php endif; ?>
 
               <!-- Baris Aksi: Count, Display Quantity, Upload, Download TXT -->
               <div style="display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-top: 14px;">
@@ -3721,8 +3878,35 @@ if ($recordType === 'nameplate') {
           <div id="fileUploadMode" style="display: none;">
             <form method="POST" enctype="multipart/form-data">
               <input type="hidden" name="menu" value="<?= htmlspecialchars($menu) ?>">
-              <label>WO Number</label>
-              <input type="text" name="wo" placeholder="Enter work order number" required>
+              <?php if ($isEvChargerMenu): ?>
+                <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; margin-bottom: 12px;">
+                  <div>
+                    <label>WO Number (Jenis PCB EV)</label>
+                    <select name="wo" required style="width: 100%; margin-bottom: 0;">
+                      <option value="">-- Pilih WO Number EV Charge --</option>
+                      <?php foreach ($evTypeOptions as $evOpt): ?>
+                        <option value="<?= htmlspecialchars($evOpt) ?>">
+                          <?= htmlspecialchars($evOpt) ?>
+                        </option>
+                      <?php endforeach; ?>
+                    </select>
+                  </div>
+                  <div>
+                    <label>Batch</label>
+                    <select name="batch_num" required style="width: 100%; margin-bottom: 0;">
+                      <option value="">-- Pilih Batch --</option>
+                      <?php for ($b = 1; $b <= 50; $b++): ?>
+                        <option value="<?= $b ?>" <?= $b === 1 ? 'selected' : '' ?>>
+                          Batch <?= $b ?>
+                        </option>
+                      <?php endfor; ?>
+                    </select>
+                  </div>
+                </div>
+              <?php else: ?>
+                <label>WO Number</label>
+                <input type="text" name="wo" placeholder="Enter work order number" required>
+              <?php endif; ?>
               <label>Upload File (.csv / .txt)</label>
               <div class="file-input">
                 <input type="file" name="file" required>
@@ -3833,8 +4017,18 @@ if ($recordType === 'nameplate') {
               }
             });
 
+            var isEvModeStep1 = <?= $isEvChargerMenu ? 'true' : 'false' ?>;
+
             if (downloadBtn) {
               downloadBtn.addEventListener("click", function () {
+                if (woInput && !woInput.value.trim()) {
+                  if (errorBox) {
+                    errorBox.textContent = "Silakan pilih WO Number terlebih dahulu sebelum download TXT.";
+                    errorBox.style.display = "block";
+                  }
+                  woInput.focus();
+                  return;
+                }
                 var info = doCount();
                 if (!info) return;
 
@@ -3862,7 +4056,7 @@ if ($recordType === 'nameplate') {
                 var link = document.createElement("a");
                 link.href = URL.createObjectURL(blob);
                 var wo = (woInput ? woInput.value.trim() : "") || "barcode_range";
-                var safeName = wo.replace(/[^a-zA-Z0-9_\-]/g, "_");
+                var safeName = wo.replace(/[\\/:*?\"<>|]/g, "_").trim();
                 link.download = safeName + ".txt";
                 document.body.appendChild(link);
                 link.click();
@@ -3871,7 +4065,31 @@ if ($recordType === 'nameplate') {
               });
             }
 
+            var isSubmitting = false;
             rangeForm.addEventListener("submit", function (e) {
+              if (isSubmitting) {
+                e.preventDefault();
+                return false;
+              }
+              if (woInput && !woInput.value.trim()) {
+                e.preventDefault();
+                if (errorBox) {
+                  errorBox.textContent = "WO Number wajib diisi/dipilih.";
+                  errorBox.style.display = "block";
+                }
+                woInput.focus();
+                return false;
+              }
+              var batchInput = document.getElementById("rangeBatch");
+              if (batchInput && !batchInput.value.trim()) {
+                e.preventDefault();
+                if (errorBox) {
+                  errorBox.textContent = "Batch wajib dipilih.";
+                  errorBox.style.display = "block";
+                }
+                batchInput.focus();
+                return false;
+              }
               var info = parseClientRange();
               if (!info.success) {
                 e.preventDefault();
@@ -3881,6 +4099,22 @@ if ($recordType === 'nameplate') {
                 }
                 return false;
               }
+              if (isEvModeStep1 && info.count > 500n) {
+                e.preventDefault();
+                if (errorBox) {
+                  errorBox.textContent = "Untuk EV Charger, jumlah nomor range tidak boleh lebih dari 500 nomor per jenis PCB / batch (Maksimal 500 nomor).";
+                  errorBox.style.display = "block";
+                }
+                return false;
+              }
+              isSubmitting = true;
+              var btnUpload = document.getElementById("btnUploadRange");
+              setTimeout(function () {
+                if (btnUpload) {
+                  btnUpload.disabled = true;
+                  btnUpload.textContent = "Mengunggah...";
+                }
+              }, 10);
             });
 
             if (toggleToFile && toggleToRange && rangeMode && fileMode) {
@@ -3903,9 +4137,9 @@ if ($recordType === 'nameplate') {
 	        <div class="card">
           <div class="step-title">
             <span class="icon">2</span>
-            Split Data WO
+            <?= $isEvChargerMenu ? 'Manajemen Data WO' : 'Split Data WO' ?>
           </div>
-          <p>Process up to 999 items per work order.</p>
+          <p><?= $isEvChargerMenu ? 'Untuk EV Charger, nomor batch langsung ditentukan saat input Range (maksimal 500 nomor per batch, tanpa split per 999). Gunakan tombol Hapus WO jika ingin membersihkan seluruh data WO yang selesai diproses.' : 'Process up to 999 items per work order.' ?></p>
           <form method="POST">
             <input type="hidden" name="menu" value="<?= htmlspecialchars($menu) ?>">
             <label>Select Work Order</label>
@@ -3920,8 +4154,13 @@ if ($recordType === 'nameplate') {
               ?>
             </select>
             <div class="button-group">
-              <button type="submit" name="split">Split</button>
-              <button type="submit" name="finish" onclick="return confirm('Yakin hapus WO ini?')">Finish</button>
+              <?php if (!$isEvChargerMenu): ?>
+                <button type="submit" name="split">Split</button>
+              <?php endif; ?>
+              <button type="submit" name="finish" onclick="return confirm('Yakin hapus seluruh data WO ini?')"><?= $isEvChargerMenu ? 'Hapus Data WO (Finish)' : 'Finish' ?></button>
+              <button type="button" onclick="openExcelExportModal('<?= $isEvChargerMenu ? 'ev_charger' : 'pcb' ?>', document.querySelector('select[name=wo_selected]') ? document.querySelector('select[name=wo_selected]').value : '')" style="background: var(--content-panel-soft); color: var(--content-text); border: 1px solid var(--content-line-strong); border-radius: 999px; padding: 0 16px; height: 38px; font-weight: 600; cursor: pointer; display: inline-flex; align-items: center; gap: 6px;">
+                &#128196; Download Excel (20 Batch)
+              </button>
             </div>
             <?php if (!empty($msgSplit)): ?>
               <p class="status-msg"><?= htmlspecialchars($msgSplit) ?></p>
@@ -3950,6 +4189,13 @@ if ($recordType === 'nameplate') {
                 </option>
               <?php } ?>
             </select>
+            <?php if (!empty($selectedWO)): ?>
+              <div style="margin-top: 12px;">
+                <button type="button" onclick="openExcelExportModal('<?= $isEvChargerMenu ? 'ev_charger' : 'pcb' ?>', '<?= htmlspecialchars($selectedWO) ?>')" class="btn-download-link" style="display: inline-flex; align-items: center; gap: 6px; padding: 6px 16px; background: #10b981; color: #fff; border-radius: 999px; text-decoration: none; font-size: 12px; font-weight: bold; border: none; cursor: pointer;">
+                  &#128196; Download Record Excel WO Ini (20 Batch)
+                </button>
+              </div>
+            <?php endif; ?>
           </form>
         </div>
 
@@ -4105,6 +4351,7 @@ if ($recordType === 'nameplate') {
 	                          <button type="button" id="btnEvQuickAll" style="font-size: 11px; padding: 4px 10px; border-radius: 6px; background: var(--content-panel); border: 1px solid var(--content-line-strong); cursor: pointer; color: var(--content-text);">Cetak Sisa (<?= $unprintedCount ?>)</button>
 	                        <?php endif; ?>
 	                        <button type="button" id="btnEvQuickFullBatch" style="font-size: 11px; padding: 4px 10px; border-radius: 6px; background: var(--content-panel); border: 1px solid var(--content-line-strong); cursor: pointer; color: var(--content-text);">Semua Batch (<?= $totalBatchCount ?>)</button>
+	                        <button type="button" id="btnEvQuick12" style="font-size: 11px; padding: 4px 10px; border-radius: 6px; background: var(--content-panel); border: 1px solid var(--content-line-strong); cursor: pointer; color: var(--content-text); font-weight: 600;">12 Pcs</button>
 	                        <button type="button" id="btnEvQuick9" style="font-size: 11px; padding: 4px 10px; border-radius: 6px; background: var(--content-panel); border: 1px solid var(--content-line-strong); cursor: pointer; color: var(--content-text);">1 Lembar (9)</button>
 	                        <button type="button" id="btnEvQuick18" style="font-size: 11px; padding: 4px 10px; border-radius: 6px; background: var(--content-panel); border: 1px solid var(--content-line-strong); cursor: pointer; color: var(--content-text);">2 Lembar (18)</button>
 	                      </div>
@@ -4117,7 +4364,7 @@ if ($recordType === 'nameplate') {
 	                    <select name="ev_type_name" required>
 	                      <option value=""><?= empty($evTypeOptions) ? 'Belum ada custom text EV' : 'Pilih Custom Text EV' ?></option>
 	                      <?php foreach ($evTypeOptions as $evTypeOption): ?>
-	                        <option value="<?= htmlspecialchars($evTypeOption) ?>"><?= htmlspecialchars($evTypeOption) ?></option>
+	                        <option value="<?= htmlspecialchars($evTypeOption) ?>" <?= (isset($woBatch) && $woBatch === $evTypeOption) ? 'selected' : '' ?>><?= htmlspecialchars($evTypeOption) ?></option>
 	                      <?php endforeach; ?>
 	                    </select>
 	                    <input type="date" name="date" value="<?= date('Y-m-d') ?>" required>
@@ -4171,6 +4418,7 @@ if ($recordType === 'nameplate') {
                   var evRangeError = document.getElementById("evRangeError");
                   var btnQuickAll = document.getElementById("btnEvQuickAll");
                   var btnQuickFullBatch = document.getElementById("btnEvQuickFullBatch");
+                  var btnQuick12 = document.getElementById("btnEvQuick12");
                   var btnQuick9 = document.getElementById("btnEvQuick9");
                   var btnQuick18 = document.getElementById("btnEvQuick18");
 
@@ -4311,6 +4559,14 @@ if ($recordType === 'nameplate') {
                     }
 
                     var baseList = unprintedList.length > 0 ? unprintedList : allBatchList;
+                    if (btnQuick12 && baseList.length > 0) {
+                      btnQuick12.addEventListener("click", function () {
+                        evStartInput.value = baseList[0];
+                        var count = Math.min(12, baseList.length);
+                        evEndInput.value = baseList[count - 1];
+                        validateEvRange();
+                      });
+                    }
                     if (btnQuick9 && baseList.length > 0) {
                       btnQuick9.addEventListener("click", function () {
                         evStartInput.value = baseList[0];
@@ -4710,6 +4966,22 @@ if ($recordType === 'nameplate') {
         <div class="topbar">
           <h1>Record Print</h1>
           <p>Pilih jenis record yang ingin dilihat: PCB atau Nameplate.</p>
+        </div>
+
+        <!-- CARD DOWNLOAD RECORD EXCEL (20 BATCH / RANGE) -->
+        <div class="card" style="border: 1px solid rgba(16, 185, 129, 0.35); background: linear-gradient(135deg, rgba(16, 185, 129, 0.05) 0%, rgba(18, 57, 104, 0.08) 100%);">
+          <div class="step-title" style="color: #10b981;">
+            <span class="icon" style="background: #10b981; color: #fff;">&#128196;</span>
+            Download Record Range Excel (20 Batch / 20.000 Nomor)
+          </div>
+          <p style="margin-top: 6px; margin-bottom: 14px; color: var(--content-muted); font-size: 13px; line-height: 1.5;">
+            Unduh laporan cetak barcode format Excel per 20 Batch (~20.000 barcode) atau rentang kustom sesuai format lembar QC fisik produksi. Anda dapat memilih rentang Batch Awal s/d Batch Akhir sebelum mengunduh.
+          </p>
+          <div>
+            <button type="button" onclick="openExcelExportModal('pcb')" class="primary" style="background: #10b981; border: 1px solid #10b981; color: #fff; padding: 10px 22px; border-radius: 999px; font-weight: bold; cursor: pointer; display: inline-flex; align-items: center; gap: 8px;">
+              &#128196; Buka Form Download Excel (20 Batch)
+            </button>
+          </div>
         </div>
 
         <div class="card">
@@ -5334,7 +5606,7 @@ if ($recordType === 'nameplate') {
             Manajemen Custom Text EV Charger
           </div>
           <p style="margin-top: 0; margin-bottom: 14px; font-size: 13px; color: var(--content-muted);">
-            Daftar pilihan dropdown Custom Text yang tersedia di halaman <strong>Print PCB EV Charger</strong>. Anda dapat menambah dan menghapus pilihan custom text di sini.
+            Daftar pilihan dropdown WO Number & Custom Text yang tersedia di halaman <strong>Print PCB EV Charger</strong>. Anda dapat menambah dan menghapus pilihan di sini.
           </p>
 
           <div style="overflow-x: auto; margin-bottom: 20px;">
@@ -7544,6 +7816,7 @@ if ($recordType === 'nameplate') {
       initAllModules();
     }
   </script>
+  <?php include 'export_record_modal.php'; ?>
 </body>
 </html>
 

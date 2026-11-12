@@ -1,11 +1,13 @@
 <?php
-session_start();
+if (session_status() === PHP_SESSION_NONE) {
+    session_start();
+}
 if (!isset($_SESSION['username']) || $_SESSION['role'] !== 'user') {
     header("Location: Login1.php");
     exit;
 }
 
-$allowedMenus = ['pcb', 'ev_charger', 'ev_charger_sn', 'nameplate', 'custom'];
+$allowedMenus = ['pcb', 'ev_charger', 'ev_charger_sn', 'nameplate', 'record', 'custom'];
 $requestedMenu = isset($_REQUEST['menu']) ? (string) $_REQUEST['menu'] : '';
 $menu = in_array($requestedMenu, $allowedMenus, true) ? $requestedMenu : 'pcb';
 $isEvChargerMenu = $menu === 'ev_charger';
@@ -58,7 +60,8 @@ $koneksi->query(
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         INDEX idx_wo (wo),
         INDEX idx_batch_id (batch_id),
-        INDEX idx_batch_printed (batch_id, is_printed)
+        INDEX idx_batch_printed (batch_id, is_printed),
+        UNIQUE KEY uniq_batch_nomor (batch_id, nomor)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
 );
 $koneksi->query(
@@ -157,7 +160,21 @@ if ($evUniqIdxRes && $evUniqIdxRes->num_rows > 0) {
 
 function loadEvChargerTypeOptions(mysqli $koneksi, $filePath)
 {
+    $defaultOptions = [
+        "2150156800-Electronic lock board",
+        "2150172180-LED board S (Head)",
+        "2150172190-LED board L (Head)",
+        "2150174700-EMC Filter(DC)",
+        "2150176020-EMC Filter(AC)",
+        "2150511950-LED board(Nozzle)",
+        "2150513770-PLC board",
+        "2150514390-CCU"
+    ];
+
     $optionsMap = [];
+    foreach ($defaultOptions as $defaultOpt) {
+        $optionsMap[$defaultOpt] = true;
+    }
 
     if (is_file($filePath)) {
         $fileJson = file_get_contents($filePath);
@@ -337,7 +354,8 @@ if (isset($_POST['print']) || isset($_POST['print_ev_charger'])) {
     $wo = $koneksi->real_escape_string($_POST['wo']);
     $start = $koneksi->real_escape_string($_POST['start']);
     $end = $koneksi->real_escape_string($_POST['end']);
-    $recordBatch = isset($_POST['record_batch']) && $_POST['record_batch'] === '1';
+    // Untuk EV Charger di portal user, setiap cetak barcode WAJIB direcord otomatis agar tidak terjadi duplikasi
+    $recordBatch = $isEvChargerPrint ? true : (isset($_POST['record_batch']) && $_POST['record_batch'] === '1');
 
     $batchRes = $koneksi->query("SELECT nama_batch FROM {$pcbBatchTable} WHERE id=$batch_id");
     $batchRow = $batchRes->fetch_assoc();
@@ -400,7 +418,7 @@ if (isset($_POST['print']) || isset($_POST['print_ev_charger'])) {
                 }
             }
             if (!empty($alreadyPrinted)) {
-                $printError = "Nomor " . $alreadyPrinted[0] . " sudah pernah di-print dan tidak dapat di-print ulang!";
+                $printError = "Nomor " . $alreadyPrinted[0] . " sudah pernah di-print dan tidak dapat di-print ulang oleh user untuk mencegah duplikasi!";
             }
         }
 
@@ -1109,6 +1127,62 @@ if ($selectedBatchIdNameplate) {
         );
     }
 }
+
+// ====== RECORD PRINT DATA UNTUK USER ======
+$recordType = isset($_GET['record_type']) ? $_GET['record_type'] : 'pcb';
+if (!in_array($recordType, ['pcb', 'nameplate', 'ev_charger', 'ev_charger_sn'], true)) {
+    $recordType = 'pcb';
+}
+
+$activeRecordRows = [];
+$activeRecordLabel = 'PCB';
+
+if ($menu === 'record') {
+    $pcbRecordRows = [];
+    $nameplateRecordRows = [];
+    $evChargerRecordRows = [];
+    $evSnRecordRows = [];
+
+    $pcbRecordRes = $koneksi->query("SELECT nama_batch, printed_at, start_number, end_number, username FROM log_print ORDER BY printed_at DESC LIMIT 200");
+    while ($pcbRecordRes && $recordRow = $pcbRecordRes->fetch_assoc()) {
+        $pcbRecordRows[] = $recordRow;
+    }
+
+    $nameplateRecordRes = $koneksi->query("SELECT nama_batch, printed_at, start_number, end_number, username FROM nameplate_log_print ORDER BY printed_at DESC LIMIT 200");
+    while ($nameplateRecordRes && $recordRowNp = $nameplateRecordRes->fetch_assoc()) {
+        $nameplateRecordRows[] = $recordRowNp;
+    }
+
+    $evChargerRecordRes = $koneksi->query("SELECT nama_batch, printed_at, start_number, end_number, username FROM ev_charger_log_print ORDER BY printed_at DESC LIMIT 200");
+    while ($evChargerRecordRes && $recordRowEv = $evChargerRecordRes->fetch_assoc()) {
+        $evChargerRecordRows[] = $recordRowEv;
+    }
+
+    $evSnRecordRes = $koneksi->query("SELECT total_printed, start_sn, end_sn, prod_date, printed_at, username FROM ev_charger_sn_log_print ORDER BY printed_at DESC LIMIT 200");
+    while ($evSnRecordRes && $recordRowSn = $evSnRecordRes->fetch_assoc()) {
+        $evSnRecordRows[] = [
+            'nama_batch' => "SN EV ({$recordRowSn['total_printed']} pcs - {$recordRowSn['prod_date']})",
+            'printed_at' => $recordRowSn['printed_at'],
+            'start_number' => $recordRowSn['start_sn'],
+            'end_number' => $recordRowSn['end_sn'],
+            'username' => $recordRowSn['username']
+        ];
+    }
+
+    if ($recordType === 'nameplate') {
+        $activeRecordRows = $nameplateRecordRows;
+        $activeRecordLabel = 'Nameplate';
+    } elseif ($recordType === 'ev_charger') {
+        $activeRecordRows = $evChargerRecordRows;
+        $activeRecordLabel = 'EV Charger';
+    } elseif ($recordType === 'ev_charger_sn') {
+        $activeRecordRows = $evSnRecordRows;
+        $activeRecordLabel = 'SN EV Charger';
+    } else {
+        $activeRecordRows = $pcbRecordRows;
+        $activeRecordLabel = 'PCB';
+    }
+}
 ?>
 <!DOCTYPE html>
 <html lang="id">
@@ -1332,13 +1406,31 @@ if ($selectedBatchIdNameplate) {
     }
 
     .sidebar {
+      position: sticky;
+      top: 0;
+      height: 100vh;
+      overflow-y: auto;
+      overflow-x: hidden;
       background: var(--sidebar);
       border-right: 1px solid var(--line);
       padding: 24px 16px;
       display: flex;
       flex-direction: column;
       gap: 18px;
-      overflow: hidden;
+      z-index: 100;
+      scrollbar-width: thin;
+      scrollbar-color: var(--line-strong) transparent;
+    }
+
+    .sidebar::-webkit-scrollbar {
+      width: 6px;
+    }
+    .sidebar::-webkit-scrollbar-thumb {
+      background: var(--line-strong);
+      border-radius: 4px;
+    }
+    .sidebar::-webkit-scrollbar-track {
+      background: transparent;
     }
 
     .sidebar-header {
@@ -2523,6 +2615,9 @@ if ($selectedBatchIdNameplate) {
       }
 
       .sidebar {
+        position: static;
+        height: auto;
+        overflow-y: visible;
         border-right: none;
         border-bottom: 1px solid var(--line);
       }
@@ -2566,6 +2661,133 @@ if ($selectedBatchIdNameplate) {
         grid-template-columns: 1fr;
       }
     }
+
+    /* RECORD PRINT STYLES */
+    .record-group h3 {
+      margin: 0 0 8px;
+      font-size: 14px;
+      letter-spacing: 0.03em;
+      color: var(--content-muted);
+      text-transform: uppercase;
+    }
+    .record-table {
+      width: 100%;
+      border-collapse: collapse;
+      background: var(--content-panel);
+      border: 1px solid var(--table-border);
+      color: var(--content-text);
+      border-radius: 12px;
+      overflow: hidden;
+    }
+    .record-table th,
+    .record-table td {
+      border: 1px solid var(--table-border);
+      padding: 9px 10px;
+      font-size: 12.5px;
+      text-align: left;
+      vertical-align: middle;
+    }
+    .record-table th {
+      background: var(--table-header-bg);
+      color: var(--table-header-text);
+      font-size: 11px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }
+    .record-table tbody tr:nth-child(even) td {
+      background: var(--table-row-even);
+    }
+    .record-table tbody tr:hover td {
+      background: var(--table-row-hover);
+    }
+    .record-empty {
+      border: 1px dashed var(--content-line-strong);
+      padding: 10px;
+      background: var(--content-panel-soft);
+      font-size: 12px;
+      color: var(--content-muted);
+      border-radius: 14px;
+    }
+    .record-filter {
+      display: flex;
+      align-items: end;
+      gap: 10px;
+      margin-bottom: 12px;
+      max-width: 340px;
+    }
+    .record-toolbar {
+      display: flex;
+      align-items: end;
+      gap: 10px;
+      flex-wrap: wrap;
+      margin-bottom: 12px;
+    }
+    .record-search {
+      flex: 1 1 320px;
+      max-width: 420px;
+    }
+    .record-date-filter {
+      display: flex;
+      align-items: end;
+      gap: 8px;
+      flex-wrap: wrap;
+      max-height: 0;
+      opacity: 0;
+      overflow: hidden;
+      transform: translateY(-8px);
+      pointer-events: none;
+      transition: max-height 0.24s ease, opacity 0.24s ease, transform 0.24s ease;
+    }
+    .record-date-filter.active {
+      max-height: 120px;
+      opacity: 1;
+      transform: translateY(0);
+      pointer-events: auto;
+    }
+    .record-date-filter input {
+      margin-bottom: 0;
+      min-width: 170px;
+    }
+    .record-date-toggle,
+    .record-date-clear {
+      align-self: end;
+      white-space: nowrap;
+    }
+    .record-pagination {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      margin-top: 12px;
+      flex-wrap: wrap;
+    }
+    .record-pagination-info {
+      font-size: 12px;
+      color: var(--content-muted);
+    }
+    .record-pagination-actions {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      flex-wrap: wrap;
+    }
+    .record-pagination button[disabled] {
+      cursor: not-allowed;
+      opacity: 0.5;
+    }
+    .record-page-jump {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 12px;
+      color: var(--content-muted);
+    }
+    .record-page-jump input {
+      width: 72px;
+      margin-bottom: 0;
+      padding: 8px 10px;
+    }
   </style>
 </head>
 <body>
@@ -2607,6 +2829,10 @@ if ($selectedBatchIdNameplate) {
 	          <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"></path><line x1="7" y1="7" x2="7.01" y2="7"></line></svg>
 	          <span class="nav-link-text">Print Nameplate Barcode</span>
 	        </a>
+	        <a class="nav-link <?= $menu === 'record' ? 'active' : '' ?>" href="userview.php?menu=record">
+	          <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path><polyline points="14 2 14 8 20 8"></polyline><line x1="16" y1="13" x2="8" y2="13"></line><line x1="16" y1="17" x2="8" y2="17"></line><polyline points="10 9 9 9 8 9"></polyline></svg>
+	          <span class="nav-link-text">Record Print</span>
+	        </a>
 	        <a class="nav-link <?= $menu === 'custom' ? 'active' : '' ?>" href="userview.php?menu=custom">
 	          <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="4" y1="21" x2="4" y2="14"></line><line x1="4" y1="10" x2="4" y2="3"></line><line x1="12" y1="21" x2="12" y2="12"></line><line x1="12" y1="8" x2="12" y2="3"></line><line x1="20" y1="21" x2="20" y2="16"></line><line x1="20" y1="12" x2="20" y2="3"></line><line x1="1" y1="14" x2="7" y2="14"></line><line x1="9" y1="8" x2="15" y2="8"></line><line x1="17" y1="16" x2="23" y2="16"></line></svg>
 	          <span class="nav-link-text">Custom Print</span>
@@ -2645,6 +2871,13 @@ if ($selectedBatchIdNameplate) {
                 </option>
               <?php } ?>
             </select>
+            <?php if (!empty($selectedWO)): ?>
+              <div style="margin-top: 12px;">
+                <button type="button" onclick="openExcelExportModal('<?= $isEvChargerMenu ? 'ev_charger' : 'pcb' ?>', '<?= htmlspecialchars($selectedWO) ?>')" class="btn-download-link" style="display: inline-flex; align-items: center; gap: 6px; padding: 6px 16px; background: #10b981; color: #fff; border-radius: 999px; text-decoration: none; font-size: 12px; font-weight: bold; border: none; cursor: pointer;">
+                  &#128196; Download Record Excel WO Ini (20 Batch)
+                </button>
+              </div>
+            <?php endif; ?>
           </form>
         </div>
 
@@ -2765,7 +2998,7 @@ if ($selectedBatchIdNameplate) {
 
 	              <?php if ($isPrinted): ?>
 	                <div class="warning-msg" style="<?= $isEvChargerMenu ? 'background: rgba(16, 185, 129, 0.1); border-color: #10b981; color: #10b981;' : '' ?>">
-	                  <?= $isEvChargerMenu ? 'Batch ini sudah selesai di-print seluruhnya dan tidak dapat di-print ulang.' : 'Batch ini sudah di-print dan tidak dapat di-print ulang.' ?>
+	                  <?= $isEvChargerMenu ? 'Batch ini sudah selesai di-print seluruhnya (' . number_format($totalBatchCount, 0, ',', '.') . ' nomor sudah tercetak) dan tidak dapat di-print ulang oleh user. Hubungi Admin jika membutuhkan cetak ulang.' : 'Batch ini sudah di-print dan tidak dapat di-print ulang.' ?>
 	                </div>
 	              <?php else: ?>
 	                <form id="printForm" method="POST" data-is-printed="<?= $isPrinted ? '1' : '0' ?>" data-is-ev="<?= $isEvChargerMenu ? '1' : '0' ?>">
@@ -2800,6 +3033,7 @@ if ($selectedBatchIdNameplate) {
 	                        </div>
 	                        <div style="display: flex; gap: 6px; flex-wrap: wrap;">
 	                          <button type="button" id="btnEvQuickAll" style="font-size: 11px; padding: 4px 10px; border-radius: 6px; background: var(--content-panel); border: 1px solid var(--content-line-strong); cursor: pointer; color: var(--content-text);">Cetak Semua Sisa (<?= $unprintedCount ?>)</button>
+	                          <button type="button" id="btnEvQuick12" style="font-size: 11px; padding: 4px 10px; border-radius: 6px; background: var(--content-panel); border: 1px solid var(--content-line-strong); cursor: pointer; color: var(--content-text); font-weight: 600;">12 Pcs</button>
 	                          <button type="button" id="btnEvQuick9" style="font-size: 11px; padding: 4px 10px; border-radius: 6px; background: var(--content-panel); border: 1px solid var(--content-line-strong); cursor: pointer; color: var(--content-text);">1 Lembar (9)</button>
 	                          <button type="button" id="btnEvQuick18" style="font-size: 11px; padding: 4px 10px; border-radius: 6px; background: var(--content-panel); border: 1px solid var(--content-line-strong); cursor: pointer; color: var(--content-text);">2 Lembar (18)</button>
 	                        </div>
@@ -2812,7 +3046,7 @@ if ($selectedBatchIdNameplate) {
 	                      <select name="ev_type_name" required>
 	                        <option value=""><?= empty($evTypeOptions) ? 'Belum ada custom text EV' : 'Pilih Custom Text EV' ?></option>
 	                        <?php foreach ($evTypeOptions as $evTypeOption): ?>
-	                          <option value="<?= htmlspecialchars($evTypeOption) ?>"><?= htmlspecialchars($evTypeOption) ?></option>
+	                          <option value="<?= htmlspecialchars($evTypeOption) ?>" <?= (isset($woBatch) && $woBatch === $evTypeOption) ? 'selected' : '' ?>><?= htmlspecialchars($evTypeOption) ?></option>
 	                        <?php endforeach; ?>
 	                      </select>
 	                      <input type="date" name="date" value="<?= date('Y-m-d') ?>" required>
@@ -2966,6 +3200,8 @@ if ($selectedBatchIdNameplate) {
                           var targetIdx = sIdx + qty - 1;
                           if (targetIdx < allBatchList.length) {
                             evEndInput.value = allBatchList[targetIdx];
+                          } else {
+                            evEndInput.value = allBatchList[allBatchList.length - 1];
                           }
                           validateEvRange();
                         });
@@ -2975,6 +3211,15 @@ if ($selectedBatchIdNameplate) {
                         btnQuickAll.addEventListener("click", function () {
                           evStartInput.value = unprintedList[0];
                           evEndInput.value = unprintedList[unprintedList.length - 1];
+                          validateEvRange();
+                        });
+                      }
+                      var btnQuick12 = document.getElementById("btnEvQuick12");
+                      if (btnQuick12 && unprintedList.length > 0) {
+                        btnQuick12.addEventListener("click", function () {
+                          evStartInput.value = unprintedList[0];
+                          var count = Math.min(12, unprintedList.length);
+                          evEndInput.value = unprintedList[count - 1];
                           validateEvRange();
                         });
                       }
@@ -3006,14 +3251,14 @@ if ($selectedBatchIdNameplate) {
                         return false;
                       }
 
-                      if (isEvMode) {
+                      if (typeof isEvMode !== "undefined" && isEvMode) {
                         var sVal = evStartInput ? evStartInput.value.trim() : "";
                         var eVal = evEndInput ? evEndInput.value.trim() : "";
                         var qVal = evQtyInput ? evQtyInput.value.trim() : "";
-                        modalTitle.textContent = "Konfirmasi Record EV Charger";
-                        modalMessage.textContent = "Cetak dan record " + qVal + " barcode (" + sVal + " s/d " + eVal + ") ke database? Nomor yang direcord tidak dapat dicetak ulang.";
-                        yesBtn.textContent = "Ya, Record & Cetak";
-                        noBtn.textContent = "Hanya Cetak (Tanpa Record)";
+                        modalTitle.textContent = "Konfirmasi Cetak Barcode EV Charger";
+                        modalMessage.textContent = "Anda akan mencetak " + qVal + " barcode (" + sVal + " s/d " + eVal + ").\n\nNomor ini otomatis dicatat ke database dan TIDAK DAPAT dicetak ulang oleh user untuk mencegah duplikasi.";
+                        yesBtn.textContent = "Ya, Cetak Barcode (" + qVal + " pcs)";
+                        noBtn.textContent = "Batal";
                       } else {
                         modalTitle.textContent = "Konfirmasi Record";
                         modalMessage.textContent = "Record batch ini ke database sebelum cetak?";
@@ -3044,6 +3289,10 @@ if ($selectedBatchIdNameplate) {
                     });
 
                     noBtn.addEventListener("click", function () {
+                      if (typeof isEvMode !== "undefined" && isEvMode) {
+                        recordModal.style.display = "none";
+                        return;
+                      }
                       recordField.value = "0";
                       printForm.dataset.confirmed = "1";
                       printForm.submit();
@@ -3108,6 +3357,13 @@ if ($selectedBatchIdNameplate) {
                     </option>
                   <?php } ?>
                 </select>
+                <?php if (!empty($selectedWONameplate)): ?>
+                  <div style="margin-top: 8px;">
+                    <button type="button" onclick="openExcelExportModal('nameplate', '<?= htmlspecialchars($selectedWONameplate) ?>')" class="btn-download-link" style="display: inline-flex; align-items: center; gap: 6px; padding: 6px 14px; background: #10b981; color: #fff; border-radius: 999px; text-decoration: none; font-size: 11px; font-weight: bold; border: none; cursor: pointer;">
+                      &#128196; Download Record Excel WO Ini (20 Batch)
+                    </button>
+                  </div>
+                <?php endif; ?>
               </div>
               <div>
                 <label>Batch</label>
@@ -3239,6 +3495,10 @@ if ($selectedBatchIdNameplate) {
                     });
 
                     noBtn.addEventListener("click", function () {
+                      if (typeof isEvMode !== "undefined" && isEvMode) {
+                        recordModal.style.display = "none";
+                        return;
+                      }
                       recordField.value = "0";
                       form.dataset.confirmed = "1";
                       form.submit();
@@ -3470,6 +3730,246 @@ if ($selectedBatchIdNameplate) {
 
           <div id="snPreviewScrollArea" style="background: #374151; padding: 24px; border-radius: 12px; overflow-x: auto; display: flex; flex-direction: column; align-items: center; gap: 4mm; min-height: 200px; box-shadow: inset 0 2px 8px rgba(0,0,0,0.3);">
             <!-- Stickers are dynamically injected here -->
+          </div>
+        </div>
+      <?php elseif ($menu === 'record'): ?>
+        <div class="topbar">
+          <h1>Record Print</h1>
+          <p>Pilih jenis record yang ingin dilihat: PCB, Nameplate, atau EV Charger.</p>
+        </div>
+
+        <!-- CARD DOWNLOAD RECORD EXCEL (20 BATCH / RANGE) -->
+        <div class="card" style="border: 1px solid rgba(16, 185, 129, 0.35); background: linear-gradient(135deg, rgba(16, 185, 129, 0.05) 0%, rgba(18, 57, 104, 0.08) 100%);">
+          <div class="step-title" style="color: #10b981;">
+            <span class="icon" style="background: #10b981; color: #fff;">&#128196;</span>
+            Download Record Range Excel (20 Batch / 20.000 Nomor)
+          </div>
+          <p style="margin-top: 6px; margin-bottom: 14px; color: var(--content-muted); font-size: 13px; line-height: 1.5;">
+            Unduh laporan cetak barcode format Excel per 20 Batch (~20.000 barcode) atau rentang kustom sesuai format lembar QC fisik produksi. Anda dapat memilih rentang Batch Awal s/d Batch Akhir sebelum mengunduh.
+          </p>
+          <div>
+            <button type="button" onclick="openExcelExportModal('pcb')" class="primary" style="background: #10b981; border: 1px solid #10b981; color: #fff; padding: 10px 22px; border-radius: 999px; font-weight: bold; cursor: pointer; display: inline-flex; align-items: center; gap: 8px;">
+              &#128196; Buka Form Download Excel (20 Batch)
+            </button>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="step-title">
+            <span class="icon">1</span>
+            Filter Record
+          </div>
+          <form method="GET" class="record-filter">
+            <input type="hidden" name="menu" value="record">
+            <div style="flex:1;">
+              <label>Jenis Record</label>
+              <select name="record_type" onchange="this.form.submit()">
+                <option value="pcb" <?= $recordType === 'pcb' ? 'selected' : '' ?>>Record PCB</option>
+                <option value="nameplate" <?= $recordType === 'nameplate' ? 'selected' : '' ?>>Record Nameplate</option>
+                <option value="ev_charger" <?= $recordType === 'ev_charger' ? 'selected' : '' ?>>Record EV Charger</option>
+                <option value="ev_charger_sn" <?= $recordType === 'ev_charger_sn' ? 'selected' : '' ?>>Record SN EV Charger</option>
+              </select>
+            </div>
+          </form>
+
+          <div class="record-group">
+            <h3>Tabel Record <?= htmlspecialchars($activeRecordLabel) ?></h3>
+            <?php if (empty($activeRecordRows)): ?>
+              <div class="record-empty">Belum ada record print <?= htmlspecialchars($activeRecordLabel) ?>.</div>
+            <?php else: ?>
+              <div class="record-toolbar">
+                <div class="record-search">
+                  <label for="recordNumberSearch">Search Number</label>
+                  <input type="text" id="recordNumberSearch" placeholder="Ketik nomor awal/akhir, auto search...">
+                </div>
+                <button type="button" id="recordDateToggle" class="record-date-toggle">Filter Tanggal</button>
+                <div id="recordDateFilterWrap" class="record-date-filter">
+                  <div>
+                    <label for="recordDateFilter">Tanggal Print</label>
+                    <input type="date" id="recordDateFilter">
+                  </div>
+                  <button type="button" id="recordDateClear" class="record-date-clear">Reset</button>
+                </div>
+              </div>
+              <table class="record-table">
+                <thead>
+                  <tr>
+                    <th>Record Batch</th>
+                    <th>Tanggal Print</th>
+                    <th>Nomor Awal</th>
+                    <th>Nomor Akhir</th>
+                    <th>User</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <?php foreach ($activeRecordRows as $recordItem): ?>
+                    <tr>
+                      <td><?= htmlspecialchars($recordItem['nama_batch']) ?></td>
+                      <td><?= htmlspecialchars(date('Y-m-d H:i:s', strtotime($recordItem['printed_at']))) ?></td>
+                      <td><?= htmlspecialchars($recordItem['start_number']) ?></td>
+                      <td><?= htmlspecialchars($recordItem['end_number']) ?></td>
+                      <td><?= htmlspecialchars($recordItem['username'] ?? '-') ?></td>
+                    </tr>
+                  <?php endforeach; ?>
+                </tbody>
+              </table>
+              <div id="recordSearchEmpty" class="record-empty" style="display:none; margin-top:10px;">Nomor tidak ditemukan.</div>
+              <div id="recordPagination" class="record-pagination">
+                <div id="recordPaginationInfo" class="record-pagination-info"></div>
+                <div class="record-pagination-actions">
+                  <button type="button" id="recordPrevPage">Prev</button>
+                  <div class="record-page-jump">
+                    <label for="recordJumpPage">Page</label>
+                    <input type="number" id="recordJumpPage" min="1" step="1">
+                    <button type="button" id="recordJumpBtn">Go</button>
+                  </div>
+                  <button type="button" id="recordNextPage">Next</button>
+                </div>
+              </div>
+              <script>
+                (function () {
+                  var searchInput = document.getElementById("recordNumberSearch");
+                  var dateToggle = document.getElementById("recordDateToggle");
+                  var dateWrap = document.getElementById("recordDateFilterWrap");
+                  var dateInput = document.getElementById("recordDateFilter");
+                  var dateClear = document.getElementById("recordDateClear");
+                  var table = document.querySelector(".record-table");
+                  var emptyInfo = document.getElementById("recordSearchEmpty");
+                  var paginationWrap = document.getElementById("recordPagination");
+                  var paginationInfo = document.getElementById("recordPaginationInfo");
+                  var prevBtn = document.getElementById("recordPrevPage");
+                  var nextBtn = document.getElementById("recordNextPage");
+                  var jumpInput = document.getElementById("recordJumpPage");
+                  var jumpBtn = document.getElementById("recordJumpBtn");
+                  if (!searchInput || !table) {
+                    return;
+                  }
+                  var rows = Array.prototype.slice.call(table.querySelectorAll("tbody tr"));
+                  var pageSize = 15;
+                  var currentPage = 1;
+                  var filteredRows = rows.slice();
+                  var totalPages = 1;
+                  function normalize(value) {
+                    return String(value || "").replace(/\s+/g, "").toLowerCase();
+                  }
+                  function renderPage() {
+                    var totalRows = filteredRows.length;
+                    totalPages = Math.max(1, Math.ceil(totalRows / pageSize));
+                    if (currentPage > totalPages) {
+                      currentPage = totalPages;
+                    }
+                    var startIndex = (currentPage - 1) * pageSize;
+                    var endIndex = startIndex + pageSize;
+                    rows.forEach(function (row) {
+                      row.style.display = "none";
+                    });
+                    filteredRows.slice(startIndex, endIndex).forEach(function (row) {
+                      row.style.display = "";
+                    });
+                    if (paginationInfo) {
+                      if (totalRows === 0) {
+                        paginationInfo.textContent = "";
+                      } else {
+                        paginationInfo.textContent = "Page " + currentPage + " / " + totalPages + " (" + totalRows + " record)";
+                      }
+                    }
+                    if (prevBtn) {
+                      prevBtn.disabled = currentPage <= 1 || totalRows === 0;
+                    }
+                    if (nextBtn) {
+                      nextBtn.disabled = currentPage >= totalPages || totalRows === 0;
+                    }
+                    if (jumpInput) {
+                      jumpInput.min = totalRows === 0 ? "0" : "1";
+                      jumpInput.max = String(totalPages);
+                      jumpInput.value = totalRows === 0 ? "" : String(currentPage);
+                      jumpInput.disabled = totalRows === 0;
+                    }
+                    if (jumpBtn) {
+                      jumpBtn.disabled = totalRows === 0;
+                    }
+                    if (paginationWrap) {
+                      paginationWrap.style.display = totalRows > 0 ? "flex" : "none";
+                    }
+                    if (emptyInfo) {
+                      emptyInfo.style.display = totalRows === 0 ? "block" : "none";
+                    }
+                  }
+                  function applySearch(resetPage) {
+                    var query = normalize(searchInput.value);
+                    var dateQuery = dateInput ? normalize(dateInput.value) : "";
+                    filteredRows = rows.filter(function (row) {
+                      var cells = row.querySelectorAll("td");
+                      var printedDate = cells[1] ? normalize(cells[1].textContent).slice(0, 10) : "";
+                      var startNumber = cells[2] ? normalize(cells[2].textContent) : "";
+                      var endNumber = cells[3] ? normalize(cells[3].textContent) : "";
+                      var matchNumber = query === "" || startNumber.indexOf(query) !== -1 || endNumber.indexOf(query) !== -1;
+                      var matchDate = dateQuery === "" || printedDate === dateQuery;
+                      return matchNumber && matchDate;
+                    });
+                    if (resetPage !== false) {
+                      currentPage = 1;
+                    }
+                    renderPage();
+                  }
+                  if (dateToggle && dateWrap) {
+                    dateToggle.addEventListener("click", function () {
+                      dateWrap.classList.toggle("active");
+                      if (dateWrap.classList.contains("active") && dateInput) {
+                        dateInput.focus();
+                      }
+                    });
+                  }
+                  if (dateInput) {
+                    dateInput.addEventListener("input", function () {
+                      applySearch(true);
+                    });
+                    dateInput.addEventListener("change", function () {
+                      applySearch(true);
+                    });
+                  }
+                  if (dateClear) {
+                    dateClear.addEventListener("click", function () {
+                      if (dateInput) {
+                        dateInput.value = "";
+                      }
+                      applySearch(true);
+                    });
+                  }
+                  if (prevBtn) {
+                    prevBtn.addEventListener("click", function () {
+                      if (currentPage > 1) {
+                        currentPage -= 1;
+                        renderPage();
+                      }
+                    });
+                  }
+                  if (nextBtn) {
+                    nextBtn.addEventListener("click", function () {
+                      if (currentPage < totalPages) {
+                        currentPage += 1;
+                        renderPage();
+                      }
+                    });
+                  }
+                  if (jumpBtn && jumpInput) {
+                    jumpBtn.addEventListener("click", function () {
+                      var targetPage = parseInt(jumpInput.value, 10);
+                      if (!isNaN(targetPage) && targetPage >= 1 && targetPage <= totalPages) {
+                        currentPage = targetPage;
+                        renderPage();
+                      }
+                    });
+                  }
+                  if (searchInput) {
+                    searchInput.addEventListener("input", function () {
+                      applySearch(true);
+                    });
+                  }
+                  applySearch(true);
+                })();
+              </script>
+            <?php endif; ?>
           </div>
         </div>
       <?php endif; ?>
@@ -5537,6 +6037,7 @@ if ($selectedBatchIdNameplate) {
       initAllModules();
     }
   </script>
+  <?php include 'export_record_modal.php'; ?>
 </body>
 </html>
 
